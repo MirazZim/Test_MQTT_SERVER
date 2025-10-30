@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      target: development
+    container_name: backend-dev
+    restart: always
+    ports:
+      - "3001:3001"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - DB_HOST=host.docker.internal # ✅ Connects to host MySQL
+      - DB_USER=root
+      - DB_PASSWORD= # Blank password
+      - DB_NAME=temp_iot_data
+      - DB_PORT=3306
+      - JWT_SECRET=HelloMyNameIsZim
+      - MQTT_HOST=mqtts://192.168.88.221:8883
+      - MQTT_USERNAME=admin
+      - MQTT_PASSWORD=StrongPassword123
+      - MQTT_CA_CERT_PATH=../src/mqtt/broker.crt
+      - MQTT_REJECT_UNAUTHORIZED=false
+      - MQTT_TLS_VERSION=TLSv1.2
+      - SPATIAL_CONTROL_ENABLED=true
+      - CONTROL_FREQUENCY=30000
+      - TEMPERATURE_TOLERANCE=0.5
+      - SIMULATE_SENSOR=false
+      - USE_REAL_SENSORS=true
+    command: [ "sh", "-c", "npx wait-on tcp:host.docker.internal:3306 && npm run dev" ]

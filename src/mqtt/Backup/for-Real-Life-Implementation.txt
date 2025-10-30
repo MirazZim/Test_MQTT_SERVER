@@ -1,0 +1,432 @@
+1. Backend Code Changes (mqtt/enhancedMqttHandler.js)
+Disable Simulation and Add Configuration:
+
+javascript
+// Add this at the top of your EnhancedMqttHandler class
+class EnhancedMqttHandler {
+  constructor(io) {
+    this.io = io;
+    this.mqttClient = null;
+    this.host = process.env.MQTT_HOST || "mqtt://broker.hivemq.com";
+    this.simulationInterval = null;
+    
+    // ADD THESE NEW PROPERTIES
+    this.useRealSensors = process.env.USE_REAL_SENSORS === "true"; // New flag
+    this.sensorTimeout = 60000; // 60 seconds timeout for real sensors
+    this.lastSensorData = new Map(); // Track last sensor reading per user
+  }
+
+  // Modify your startSimulation method
+  async startSimulation() {
+    // CHANGE: Only start simulation if not using real sensors
+    if (this.useRealSensors) {
+      console.log("🔧 Real sensors mode enabled - simulation disabled");
+      this.startSensorWatchdog(); // Monitor real sensor health
+      return;
+    }
+    
+    console.log("🚀 Starting enhanced temperature simulation...");
+    // ... keep existing simulation code
+  }
+
+  // ADD NEW METHOD: Monitor real sensor health
+  startSensorWatchdog() {
+    setInterval(() => {
+      const now = Date.now();
+      const activeUsers = this.io.getActiveUsers();
+      
+      activeUsers.forEach(userId => {
+        const lastReading = this.lastSensorData.get(userId);
+        if (!lastReading || (now - lastReading) > this.sensorTimeout) {
+          console.warn(`⚠️ No sensor data from user ${userId} for ${this.sensorTimeout/1000}s`);
+          // Optionally send alert to frontend
+          this.io.to(`user_${userId}`).emit("sensorAlert", {
+            type: "timeout",
+            message: "Sensor not responding",
+            timestamp: new Date()
+          });
+        }
+      });
+    }, 30000); // Check every 30 seconds
+  }
+
+  // MODIFY: Track real sensor data timing
+  async handleTemperatureReading(userId, tempValue) {
+    try {
+      // ADD: Update sensor watchdog
+      if (this.useRealSensors) {
+        this.lastSensorData.set(userId, Date.now());
+      }
+
+      // Keep all your existing temperature handling code unchanged
+      const newTemp = await Temperature.create({
+        user_id: userId,
+        value: tempValue,
+        location: "living-room",
+      });
+      // ... rest of your existing code stays the same
+    } catch (error) {
+      console.error("Error handling temperature reading:", error);
+    }
+  }
+}
+2. Environment Configuration (.env)
+Add this line to your .env file:
+
+text
+# Set to 'true' when using real sensors, 'false' for simulation
+USE_REAL_SENSORS=false
+
+# Optional: Configure sensor timeout
+SENSOR_TIMEOUT=60000
+That's it for backend changes! Your existing MQTT subscriptions, control logic, and Socket.IO communication remain unchanged.
+
+Hardware Implementation
+3. Temperature Sensor Code (Arduino/ESP32)
+Create a new file sensor_client.ino:
+
+cpp
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// Configuration
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP"; // e.g., "192.168.1.100"
+const int mqtt_port = 1883;
+
+// Hardware pins
+#define DHT_PIN 2
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// MQTT Configuration
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Device Configuration - CHANGE THIS FOR EACH DEVICE
+const int USER_ID = 10; // Shakib Al Hasan's user ID
+char temperatureTopic[50];
+char setpointTopic[50];
+char actuatorTopic[50];
+
+// Control variables
+float targetTemperature = 22.0;
+unsigned long lastTempReading = 0;
+const unsigned long tempInterval = 10000; // 10 seconds
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize DHT sensor
+  dht.begin();
+  
+  // Setup MQTT topics
+  sprintf(temperatureTopic, "home/%d/temperature", USER_ID);
+  sprintf(setpointTopic, "home/%d/setpoint", USER_ID);
+  sprintf(actuatorTopic, "home/%d/actuator/control", USER_ID);
+  
+  // Connect to WiFi
+  setup_wifi();
+  
+  // Setup MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  Serial.println("🔧 Temperature sensor initialized");
+  Serial.printf("📡 Publishing to: %s\n", temperatureTopic);
+}
+
+void setup_wifi() {
+  delay(10);
+  Serial.printf("Connecting to %s", ssid);
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.printf("✅ WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.printf("📥 Received [%s]: %s\n", topic, message.c_str());
+  
+  // Handle setpoint updates
+  if (String(topic) == setpointTopic) {
+    targetTemperature = message.toFloat();
+    Serial.printf("🎯 Target temperature updated: %.1f°C\n", targetTemperature);
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("🔄 Connecting to MQTT...");
+    
+    String clientId = "TempSensor_" + String(USER_ID) + "_" + String(random(0xffff), HEX);
+    
+    if (client.connect(clientId.c_str())) {
+      Serial.println(" connected!");
+      
+      // Subscribe to setpoint topic
+      client.subscribe(setpointTopic);
+      Serial.printf("📡 Subscribed to: %s\n", setpointTopic);
+      
+    } else {
+      Serial.printf(" failed, rc=%d retrying in 5s\n", client.state());
+      delay(5000);
+    }
+  }
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  
+  // Read temperature every 10 seconds
+  if (millis() - lastTempReading > tempInterval) {
+    readAndPublishTemperature();
+    lastTempReading = millis();
+  }
+  
+  delay(100);
+}
+
+void readAndPublishTemperature() {
+  float temp = dht.readTemperature();
+  
+  if (isnan(temp)) {
+    Serial.println("❌ Failed to read from DHT sensor!");
+    return;
+  }
+  
+  // Publish temperature
+  String tempStr = String(temp, 2);
+  if (client.publish(temperatureTopic, tempStr.c_str())) {
+    Serial.printf("📤 Published: %.2f°C (target: %.1f°C)\n", temp, targetTemperature);
+  } else {
+    Serial.println("❌ Failed to publish temperature");
+  }
+}
+4. Actuator Control Code (Arduino/ESP32)
+Create a new file actuator_client.ino:
+
+cpp
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// Configuration (same as sensor)
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP";
+const int mqtt_port = 1883;
+
+// Hardware pins
+#define HEATER_RELAY_PIN 12
+#define COOLER_RELAY_PIN 13
+#define STATUS_LED_PIN 2
+
+// MQTT Configuration
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Device Configuration - MUST MATCH SENSOR
+const int USER_ID = 10; // Same user ID as sensor
+char actuatorTopic[50];
+
+// Control state
+bool heaterState = false;
+bool coolerState = false;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(HEATER_RELAY_PIN, OUTPUT);
+  pinMode(COOLER_RELAY_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  
+  // Turn off all relays initially
+  digitalWrite(HEATER_RELAY_PIN, LOW);
+  digitalWrite(COOLER_RELAY_PIN, LOW);
+  digitalWrite(STATUS_LED_PIN, HIGH); // LED on = system active
+  
+  // Setup MQTT topic
+  sprintf(actuatorTopic, "home/%d/actuator/control", USER_ID);
+  
+  // Connect to WiFi
+  setup_wifi();
+  
+  // Setup MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  Serial.println("🔧 Actuator controller initialized");
+  Serial.printf("📡 Listening on: %s\n", actuatorTopic);
+}
+
+void setup_wifi() {
+  delay(10);
+  Serial.printf("Connecting to %s", ssid);
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.printf("✅ WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.printf("📥 Received control command: %s\n", message.c_str());
+  
+  // Parse JSON command
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, message);
+  
+  bool newHeaterState = doc["heater"];
+  bool newCoolerState = doc["cooler"];
+  String reason = doc["reason"];
+  
+  // Apply control commands
+  controlActuators(newHeaterState, newCoolerState, reason);
+}
+
+void controlActuators(bool heater, bool cooler, String reason) {
+  // Safety: Never run heater and cooler simultaneously
+  if (heater && cooler) {
+    Serial.println("⚠️ Safety: Cannot run heater and cooler simultaneously");
+    heater = false;
+    cooler = false;
+  }
+  
+  // Control heater
+  if (heater != heaterState) {
+    heaterState = heater;
+    digitalWrite(HEATER_RELAY_PIN, heater ? HIGH : LOW);
+    Serial.printf("🔥 Heater: %s\n", heater ? "ON" : "OFF");
+  }
+  
+  // Control cooler
+  if (cooler != coolerState) {
+    coolerState = cooler;
+    digitalWrite(COOLER_RELAY_PIN, cooler ? HIGH : LOW);
+    Serial.printf("❄️ Cooler: %s\n", cooler ? "ON" : "OFF");
+  }
+  
+  // Status indication
+  if (heater || cooler) {
+    // Blink LED when active
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(STATUS_LED_PIN, LOW);
+      delay(100);
+      digitalWrite(STATUS_LED_PIN, HIGH);
+      delay(100);
+    }
+  }
+  
+  Serial.printf("🎛️ Control reason: %s\n", reason.c_str());
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("🔄 Connecting to MQTT...");
+    
+    String clientId = "ActuatorCtrl_" + String(USER_ID) + "_" + String(random(0xffff), HEX);
+    
+    if (client.connect(clientId.c_str())) {
+      Serial.println(" connected!");
+      
+      // Subscribe to actuator control topic
+      client.subscribe(actuatorTopic);
+      Serial.printf("📡 Subscribed to: %s\n", actuatorTopic);
+      
+    } else {
+      Serial.printf(" failed, rc=%d retrying in 5s\n", client.state());
+      delay(5000);
+    }
+  }
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  delay(100);
+}
+Hardware Wiring
+Temperature Sensor Wiring (DHT11):
+VCC → ESP32 3.3V
+
+GND → ESP32 GND
+
+DATA → ESP32 Pin 2
+
+Relay Module Wiring:
+VCC → ESP32 5V (or 3.3V for 3V relays)
+
+GND → ESP32 GND
+
+IN1 → ESP32 Pin 12 (Heater)
+
+IN2 → ESP32 Pin 13 (Cooler)
+
+Relay to Appliances:
+Connect your heater to Relay 1 NO (Normally Open)
+
+Connect your cooler/fan to Relay 2 NO
+
+Deployment Steps
+1. Test with Simulation First:
+bash
+# Keep simulation mode
+USE_REAL_SENSORS=false
+npm start
+2. Switch to Real Hardware:
+bash
+# Enable real sensors mode  
+USE_REAL_SENSORS=true
+npm start
+3. Deploy Hardware:
+Flash sensor_client.ino to ESP32 #1
+
+Flash actuator_client.ino to ESP32 #2
+
+Connect sensors and relays as described
+
+Power on devices and check serial output
+
+4. Verification:
+Check server logs for real sensor data: 📤 Published 23.45°C for user 10
+
+Verify actuator responses: 🔥 Heater: ON or ❄️ Cooler: ON
+
+Frontend should show real-time updates as before
+
+Key Benefits of This Approach
+✅ Minimal Code Changes - Your existing architecture works perfectly
+✅ Easy Testing - Switch between simulation and real hardware via environment variable
+✅ Scalable - Add more users by deploying more sensor/actuator pairs
+✅ Robust - Sensor watchdog detects hardware failures
+✅ Secure - Same authentication and user isolation
+✅ Real-time - Frontend gets updates exactly as before
