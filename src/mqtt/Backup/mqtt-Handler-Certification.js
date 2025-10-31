@@ -2,10 +2,10 @@ const mqtt = require("mqtt");
 const fs = require("fs"); // 🔒 Required for reading certificate files
 const { performance } = require("perf_hooks");
 const { Mutex } = require("async-mutex");
-const Temperature = require("../models/Temperature");
-const Measurement = require("../models/Measurement");
-const User = require("../models/User");
-const pool = require("../config/db");
+const Temperature = require("../../models/Temperature");
+const Measurement = require("../../models/Measurement");
+const User = require("../../models/User");
+const pool = require("../../config/db");
 
 class EnhancedMqttHandler {
     constructor(io) {
@@ -2113,7 +2113,7 @@ class EnhancedMqttHandler {
 
     async emitLocationListUpdate(userId) {
         try {
-            const Measurement = require("../models/Measurement");
+            const Measurement = require("../../models/Measurement");
             const locations = await Measurement.getUserLocations(userId);
 
             this.io.to(`user_${userId}`).emit("locationListUpdate", {

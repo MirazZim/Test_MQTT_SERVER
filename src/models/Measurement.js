@@ -48,24 +48,28 @@ const getUserLocations = async (userId) => {
     );
     return rows;
 };
-const getBowlTempHistory = async (userId, location, days = 7) => {
-    const [rows] = await pool.execute(
-        `SELECT 
-      DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') as timestamp,
-      AVG(bowl_temp) as avg_bowl_temp,
-      MIN(bowl_temp) as min_bowl_temp,
-      MAX(bowl_temp) as max_bowl_temp,
-      COUNT(*) as readings_count
-    FROM measurements
-    WHERE user_id = ? 
-      AND location = ? 
-      AND bowl_temp IS NOT NULL
-      AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d %H:%i')
-    ORDER BY created_at ASC`,
+
+const getBowlTempHistory = async (userId, location, days) => {
+    const [rows] = await pool.query(
+        `SELECT
+      DATE_FORMAT(sm.measured_at, '%Y-%m-%d %H:%i:%s') as timestamp,
+      sm.measured_value as value,
+      s.sensor_name,
+      r.room_name
+    FROM sensor_measurements sm
+    INNER JOIN sensors s ON sm.sensor_id = s.id
+    INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+    INNER JOIN rooms r ON s.room_id = r.id
+    WHERE s.user_id = ?
+      AND st.type_code = 'bowl_temp'
+      AND r.room_code = ?
+      AND s.is_active = 1
+      AND sm.measured_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+    ORDER BY sm.measured_at ASC`,
         [userId, location, days]
     );
     return rows;
 };
+
 
 module.exports = { create, getLatestForUser, getUserLocations, getBowlTempHistory };

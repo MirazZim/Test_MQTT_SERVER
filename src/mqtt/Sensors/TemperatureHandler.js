@@ -1,140 +1,110 @@
-// // src/mqtt/sensors/TemperatureHandler.js
-// const BaseSensorHandler = require('../base/BaseSensorHandler');
-// const pool = require('../../config/db');
+// mqtt/sensors/TemperatureHandler.js
+// ✅ UPDATED FOR redesigned_iot_database schema with dynamic topic matching
+const BaseSensorHandler = require('../base/BaseSensorHandler');
+const pool = require('../../config/db');
 
-// class TemperatureHandler extends BaseSensorHandler {
-//     async handleTemperatureData(topic, messageValue) {
-//         console.log(`\n🌡️ ========== TEMPERATURE DATA ==========`);
-//         console.log(`🌡️ Raw value: ${messageValue}`);
-//         console.log(`🌡️ Active users: ${this.activeUsers.size}`);
-
-//         try {
-//             const validation = this.validateNumeric(messageValue, -200, 5000);
-//             if (!validation.valid) {
-//                 console.warn(`⚠️ Invalid temperature value`);
-//                 return;
-//             }
-
-//             let temperatureValue = validation.value * 10.6;
-//             console.log(`🌡️ Converted temperature: ${temperatureValue.toFixed(2)}°C`);
-
-//             await this.updateSensorCache('temperature', temperatureValue);
-
-//             if (this.activeUsers.size === 0) {
-//                 console.log('⏸️ No active users - skipping');
-//                 return;
-//             }
-
-//             const release = await this.sensorDataMutex.acquire();
-//             let currentState;
-//             try {
-//                 currentState = {
-//                     temperature: this.sensorData.temperature,
-//                     humidity: this.sensorData.humidity,
-//                     bowl_temp: this.sensorData.bowl_temp,
-//                     sonar_distance: this.sensorData.sonar_distance,
-//                     co2_level: this.sensorData.co2_level,
-//                     sugar_level: this.sensorData.sugar_level
-//                 };
-//             } finally {
-//                 release();
-//             }
-
-//             for (const [userId, locations] of this.activeUsers) {
-//                 for (const location of locations) {
-//                     try {
-//                         await pool.execute(`
-//                             INSERT INTO measurements 
-//                             (user_id, temperature, humidity, bowl_temp, sonar_distance, co2_level, sugar_level, airflow, location, created_at)
-//                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-//                             [userId, currentState.temperature, currentState.humidity, currentState.bowl_temp,
-//                                 currentState.sonar_distance, currentState.co2_level, currentState.sugar_level,
-//                                 2.0, location, new Date()]
-//                         );
-//                         console.log(`✅ Stored measurement for user ${userId}`);
-//                     } catch (error) {
-//                         console.error(`❌ DB error:`, error.message);
-//                     }
-
-//                     const enriched = {
-//                         temperature: currentState.temperature,
-//                         humidity: currentState.humidity,
-//                         bowl_temp: currentState.bowl_temp,
-//                         sonar_distance: currentState.sonar_distance,
-//                         co2_level: currentState.co2_level,
-//                         sugar_level: currentState.sugar_level,
-//                         airflow: 2.0,
-//                         user_id: userId,
-//                         location: location,
-//                         created_at: new Date().toISOString()
-//                     };
-
-//                     this.io.to(`location_${location}`).emit("newMeasurement", enriched);
-//                     this.io.to(`user_${userId}`).emit("newMeasurement", enriched);
-//                     this.io.to(`location_${location}`).emit("environmentUpdate", enriched);
-//                     this.io.to(`user_${userId}`).emit("environmentUpdate", enriched);
-
-//                     console.log(`📡 Emitted to location_${location} and user_${userId}`);
-
-//                     // ✅ CRITICAL: Call handleEnvironmentReading to emit to user_userId_location room
-//                     if (this.mqttHandler && this.mqttHandler.handleEnvironmentReading) {
-//                         await this.mqttHandler.handleEnvironmentReading(userId, location, {
-//                             temperature: currentState.temperature,
-//                             humidity: currentState.humidity,
-//                             bowl_temp: currentState.bowl_temp,
-//                             sonar_distance: currentState.sonar_distance,
-//                             co2_level: currentState.co2_level,
-//                             sugar_level: currentState.sugar_level,
-//                             airflow: 2.0
-//                         });
-//                     }
-//                 }
-//             }
-
-//             console.log(`🌡️ ========== END TEMPERATURE DATA ==========\n`);
-
-//         } catch (error) {
-//             console.error(`❌ Error handling temperature:`, error);
-//         }
-//     }
-// }
-
-// module.exports = TemperatureHandler;
-// Updated for new schema: Use handleEnvironmentReading from EnhancedMqttHandler
-
-const EnhancedMqttHandler = require('../EnhancedMqttHandler');  // Import base
-
-class TemperatureHandler {
-    async handleTemperatureData(topic, rawValue) {
-        console.log(`🌡️ ========== TEMPERATURE DATA ==========`);
-        console.log(`🌡️ Raw value: ${rawValue}`);
-        const activeUsers = getActiveUsers();  // Assuming this function
-        console.log(`🌡️ Active users: ${activeUsers.length}`);
-
-        // Convert value (kept as-is, assuming your logic)
-        const temperature = parseFloat(rawValue) * 10.58;  // Example conversion; adjust as per your code
-        console.log(`🌡️ Converted temperature: ${temperature}°C`);
-
-        // For each user/location (assuming multi-location from your logs)
-        for (const user of activeUsers) {
-            try {
-                const location = user.location || 'sensor-room';  // Derive from context
-                await EnhancedMqttHandler.handleEnvironmentReading(user.id, this.getSensorCode(topic), temperature, location);
-                console.log(`🔄 Updated temperature: ${temperature}`);
-            } catch (error) {
-                console.error(`❌ DB update failed for user ${user.id}: ${error.message}`);
-            }
-        }
-
-        // Broadcast (kept as-is)
-        console.log(`🔄 Real sensor ${topic}: ${temperature}°C → Broadcasted to all users`);
-        console.log(`🌡️ ========== END TEMPERATURE DATA ==========`);
+class TemperatureHandler extends BaseSensorHandler {
+    constructor(io, sensorData, activeUsers, sensorDataMutex) {
+        super(io, sensorData, activeUsers, sensorDataMutex);
+        console.log(`🔵 [TemperatureHandler] Initialized`);
     }
 
-    getSensorCode(topic) {
-        // Map topic to sensor_code (e.g., 'ESP2' → 'REAL_TEMP_004')
-        const map = { 'ESP2': 'REAL_TEMP_004', 'ESPX2': 'REAL_TEMP_002' };  // Add from your config
-        return map[topic] || topic;
+    async handleTemperatureData(topic, payload) {
+        console.log(`\n🌡️ ========== TEMPERATURE HANDLER ==========`);
+        console.log(`🔵 [TemperatureHandler] Topic: ${topic}, Payload: ${payload}`);
+
+        const value = parseFloat(payload);
+        if (!Number.isFinite(value)) {
+            console.warn(`⚠️ [TemperatureHandler] Invalid temperature value: ${payload}`);
+            return;
+        }
+
+        // ESP2 specific conversion (adjust based on your sensor calibration)
+        const adjustedValue = value * 10.6;
+        console.log(`🌡️ [TemperatureHandler] Raw: ${value}, Adjusted: ${adjustedValue.toFixed(2)}`);
+
+        // Update cache
+        this.updateCache('temperature', adjustedValue);
+        console.log(`🌡️ [TemperatureHandler] Active users: ${this.activeUsers.size}`);
+
+        // Save to database and emit for all active users
+        for (const [userId, rooms] of this.activeUsers) {
+            try {
+                console.log(`🔵 [TemperatureHandler] Processing user ${userId} with rooms:`, Array.from(rooms));
+
+                // Save to database for each room the user is monitoring
+                for (const roomCode of rooms) {
+                    await this.saveToDB(userId, roomCode, topic, adjustedValue);
+                }
+
+                // Emit to user's socket room
+                this.io.to(`user_${userId}`).emit('temperatureUpdate', {
+                    temperature: adjustedValue,
+                    timestamp: new Date(),
+                    source: topic
+                });
+                console.log(`📡 [TemperatureHandler] Emitted to user_${userId}`);
+
+            } catch (error) {
+                console.error(`❌ [TemperatureHandler] Error for user ${userId}:`, error.message);
+            }
+        }
+        console.log(`🌡️ ========== END TEMPERATURE HANDLER ==========\n`);
+    }
+
+    async saveToDB(userId, roomCode, mqttTopic, value) {
+        try {
+            console.log(`🔵 [TemperatureHandler] Saving to DB - User: ${userId}, Room: ${roomCode}, Topic: ${mqttTopic}`);
+
+            // Get room_id
+            const [rooms] = await pool.execute(
+                'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
+                [userId, roomCode]
+            );
+
+            if (rooms.length === 0) {
+                console.warn(`⚠️ [TemperatureHandler] No room found for user ${userId}, room_code: ${roomCode}`);
+                return;
+            }
+
+            const roomId = rooms[0].id;
+            console.log(`✅ [TemperatureHandler] Found room_id: ${roomId}`);
+
+            // Get sensor_id by mqtt_topic (DYNAMIC TOPIC MATCHING)
+            const [sensors] = await pool.execute(
+                `SELECT id FROM sensors 
+         WHERE user_id = ? 
+         AND room_id = ? 
+         AND mqtt_topic = ? 
+         AND is_active = 1`,
+                [userId, roomId, mqttTopic]
+            );
+
+            if (sensors.length === 0) {
+                console.warn(`⚠️ [TemperatureHandler] No sensor found for topic: ${mqttTopic} in room ${roomId}`);
+                return;
+            }
+
+            const sensorId = sensors[0].id;
+            console.log(`✅ [TemperatureHandler] Found sensor_id: ${sensorId}`);
+
+            // Insert measurement
+            await pool.execute(
+                'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
+                [sensorId, value]
+            );
+
+            // Update last_reading_at in sensors table
+            await pool.execute(
+                'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
+                [sensorId]
+            );
+
+            console.log(`✅ [TemperatureHandler] Saved: ${value.toFixed(2)}°C (sensor_id: ${sensorId})`);
+
+        } catch (error) {
+            console.error(`❌ [TemperatureHandler] DB error:`, error.message);
+        }
     }
 }
 

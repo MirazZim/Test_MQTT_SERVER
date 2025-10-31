@@ -9,7 +9,7 @@
 // const logUserAction = async (userId, username, actionType, actionDescription, oldValue, newValue, location = 'main-room', ipAddress = 'Unknown') => {
 //     try {
 //         await pool.execute(`
-//             INSERT INTO user_action_audit 
+//             INSERT INTO user_action_audit
 //             (user_id, username, action_type, action_description, old_value, new_value, location, ip_address, session_id, created_at)
 //             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
 //         `, [
@@ -246,12 +246,12 @@
 //         const days = parseInt(req.query.days) || 7;
 
 //         const [historyRows] = await pool.execute(`
-//             SELECT 
+//             SELECT
 //                 heater_state,
 //                 cooler_state,
 //                 control_mode,
 //                 last_control_action
-//             FROM device_control_states 
+//             FROM device_control_states
 //             WHERE user_id = ? AND last_control_action >= DATE_SUB(NOW(), INTERVAL ? DAY)
 //             ORDER BY last_control_action DESC
 //         `, [userId, days]);
@@ -275,26 +275,34 @@
 // });
 
 // module.exports = temperatureControlRouter;
+// routes/temperatureControlRoutes.js
+// Updated to use room_control_settings for targets (requires location param for room).
+// Used actuator_states for control states (heater/cooler).
+// Adjusted audit to match user_audit_log schema.
+// Removed duplicate POST route.
+// Added location to routes (query param, default 'main-room').
+
 const express = require("express");
 const { adminOrUser } = require("../middleware/auth");
 const pool = require("../config/db");
 
 const temperatureControlRouter = express.Router();
 
-// Updated: Audit logger uses user_audit_log (was user_action_audit), added room_id
+
+// Create audit logger helper function (UPDATED to match schema)
 const logUserAction = async (userId, actionType, actionDescription, oldValue, newValue, roomId = null, ipAddress = 'Unknown', userAgent = 'Unknown') => {
     try {
         await pool.execute(`
-            INSERT INTO user_audit_log 
-            (user_id, room_id, action_type, action_description, old_value, new_value, ip_address, user_agent, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            INSERT INTO user_audit_log
+            (user_id, room_id, action_type, action_description, old_value, new_value, entity_type, entity_id, ip_address, user_agent, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NOW())
         `, [
             userId,
             roomId,
             actionType,
             actionDescription,
-            oldValue ? JSON.stringify(oldValue) : null,
-            newValue ? JSON.stringify(newValue) : null,
+            oldValue,
+            newValue,
             ipAddress,
             userAgent
         ]);
@@ -322,10 +330,11 @@ const logUserAction = async (userId, actionType, actionDescription, oldValue, ne
     }
 };
 
-// Updated: Setpoint per room (added room_id support via location/room_code, uses room_control_settings)
+// Set desired temperature (update room_control_settings target_temperature) - ENHANCED WITH AUDIT TRAIL
 temperatureControlRouter.post("/setpoint", adminOrUser, async (req, res) => {
     try {
-        const { targetTemperature, location = 'main-room' } = req.body;
+        const { targetTemperature } = req.body;
+        const location = req.query.location || 'main-room'; // Add location param
         const userId = req.user.id;
 
         if (targetTemperature === undefined || targetTemperature === null) {
@@ -344,23 +353,37 @@ temperatureControlRouter.post("/setpoint", adminOrUser, async (req, res) => {
         }
 
         // Get room_id
-        const [rooms] = await pool.execute("SELECT id FROM rooms WHERE user_id = ? AND room_code = ?", [userId, location]);
-        if (rooms.length === 0) return res.status(404).json({ status: "failed", message: "Room not found" });
-        const roomId = rooms[0].id;
+        const [roomRows] = await pool.execute(
+            "SELECT id FROM rooms WHERE user_id = ? AND room_code = ?",
+            [userId, location]
+        );
+        const roomId = roomRows[0]?.id;
+        if (!roomId) {
+            return res.status(404).json({
+                status: "failed",
+                message: "Room not found"
+            });
+        }
 
-        // Get old value for audit
-        const [oldSettings] = await pool.execute("SELECT target_temperature FROM room_control_settings WHERE room_id = ?", [roomId]);
-        const oldTemperature = oldSettings[0] ? oldSettings[0].target_temperature : null;
+        // GET OLD VALUE FOR AUDIT TRAIL
+        const [settingRows] = await pool.execute(
+            "SELECT target_temperature FROM room_control_settings WHERE room_id = ?",
+            [roomId]
+        );
 
-        // Get username for logging (optional)
-        const [userRows] = await pool.execute("SELECT username FROM users WHERE id = ?", [userId]);
-        const username = userRows[0] ? userRows[0].username : 'Unknown';
+        let oldTemperature = null;
+        if (settingRows.length > 0) {
+            oldTemperature = settingRows[0].target_temperature;
+        }
 
-        // Update setpoint
-        await pool.execute("UPDATE room_control_settings SET target_temperature = ? WHERE room_id = ?", [temp, roomId]);
+        // Update room_control_settings target_temperature
+        await pool.execute(
+            "UPDATE room_control_settings SET target_temperature = ? WHERE room_id = ?",
+            [temp, roomId]
+        );
 
-        // Log audit
-        await logUserAction(
+        // LOG TO AUDIT TRAIL
+        logUserAction(
             userId,
             'TEMPERATURE_SET',
             'Temperature Setpoint Changed',
@@ -369,9 +392,9 @@ temperatureControlRouter.post("/setpoint", adminOrUser, async (req, res) => {
             roomId,
             req.ip || 'Unknown',
             req.headers['user-agent'] || 'Unknown'
-        );
+        ).catch(err => console.error('Audit logging failed:', err));
 
-        // Publish to MQTT with location
+        // Get the MQTT client to publish setpoint change
         const { mqttClient } = require("../server");
         if (mqttClient && mqttClient.mqttClient) {
             mqttClient.mqttClient.publish(
@@ -381,16 +404,19 @@ temperatureControlRouter.post("/setpoint", adminOrUser, async (req, res) => {
             );
         }
 
+        // RESPONSE
         res.status(200).json({
             status: "success",
             message: "Target temperature set successfully",
             data: {
                 userId,
+                roomId,
                 location,
                 targetTemperature: temp,
                 auditLogged: true
             }
         });
+
     } catch (error) {
         console.error("Error setting target temperature:", error);
         res.status(500).json({
@@ -400,29 +426,53 @@ temperatureControlRouter.post("/setpoint", adminOrUser, async (req, res) => {
     }
 });
 
-// Updated: Get setpoint per room (added room_id via location)
+// Get current setpoint and control state
 temperatureControlRouter.get("/setpoint", adminOrUser, async (req, res) => {
     try {
-        const userId = req.user.id;
         const location = req.query.location || 'main-room';
+        const userId = req.user.id;
 
         // Get room_id
-        const [rooms] = await pool.execute("SELECT id FROM rooms WHERE user_id = ? AND room_code = ?", [userId, location]);
-        if (rooms.length === 0) return res.status(404).json({ status: "failed", message: "Room not found" });
-        const roomId = rooms[0].id;
+        const [roomRows] = await pool.execute(
+            "SELECT id FROM rooms WHERE user_id = ? AND room_code = ?",
+            [userId, location]
+        );
+        const roomId = roomRows[0]?.id;
+        if (!roomId) {
+            return res.status(404).json({
+                status: "failed",
+                message: "Room not found"
+            });
+        }
 
-        // Get setpoint
-        const [settings] = await pool.execute("SELECT target_temperature as desired_temperature FROM room_control_settings WHERE room_id = ?", [roomId]);
-        const desiredTemperature = settings[0] ? parseFloat(settings[0].desired_temperature) : 22.00;
+        // Get target_temperature from room_control_settings
+        const [settingRows] = await pool.execute(
+            "SELECT target_temperature FROM room_control_settings WHERE room_id = ?",
+            [roomId]
+        );
 
-        // Get states (from actuator_states, was device_control_states)
-        const [states] = await pool.execute("SELECT actuator_type, state, timestamp as last_control_action FROM actuator_states WHERE room_id = ?", [roomId]);
+        if (settingRows.length === 0) {
+            return res.status(404).json({
+                status: "failed",
+                message: "Settings not found"
+            });
+        }
+
+        // Get current control state from actuator_states (for heater and cooler)
+        const [heaterRows] = await pool.execute(
+            "SELECT state, control_mode FROM actuator_states WHERE user_id = ? AND room_id = ? AND actuator_type = 'heater'",
+            [userId, roomId]
+        );
+        const [coolerRows] = await pool.execute(
+            "SELECT state, control_mode FROM actuator_states WHERE user_id = ? AND room_id = ? AND actuator_type = 'cooler'",
+            [userId, roomId]
+        );
 
         const controlState = {
-            heater_state: states.find(s => s.actuator_type === 'heater')?.state || false,
-            cooler_state: states.find(s => s.actuator_type === 'cooler')?.state || false,
-            control_mode: settings[0]?.control_mode || 'auto',
-            last_action: states[0]?.last_control_action || null  // Assuming latest timestamp
+            heaterState: heaterRows[0]?.state || 0,
+            coolerState: coolerRows[0]?.state || 0,
+            controlMode: heaterRows[0]?.control_mode || 'auto', // Assume same for both
+            lastAction: heaterRows[0]?.timestamp || new Date() // Use timestamp as last action
         };
 
         res.status(200).json({
@@ -430,11 +480,13 @@ temperatureControlRouter.get("/setpoint", adminOrUser, async (req, res) => {
             message: "Setpoint and control state retrieved successfully",
             data: {
                 userId,
+                roomId,
                 location,
-                desiredTemperature,
+                desiredTemperature: parseFloat(settingRows[0].target_temperature),
                 controlState
             }
         });
+
     } catch (error) {
         console.error("Error getting setpoint:", error);
         res.status(500).json({
@@ -444,25 +496,38 @@ temperatureControlRouter.get("/setpoint", adminOrUser, async (req, res) => {
     }
 });
 
-// Updated: Control history from actuator_control_logs (was device_control_states), with room_id
+// Get control history for user
 temperatureControlRouter.get("/control-history", adminOrUser, async (req, res) => {
     try {
+        const location = req.query.location || 'main-room';
         const userId = req.user.id;
         const days = parseInt(req.query.days) || 7;
-        const location = req.query.location || 'main-room';
 
         // Get room_id
-        const [rooms] = await pool.execute("SELECT id FROM rooms WHERE user_id = ? AND room_code = ?", [userId, location]);
-        if (rooms.length === 0) return res.status(404).json({ status: "failed", message: "Room not found" });
-        const roomId = rooms[0].id;
+        const [roomRows] = await pool.execute(
+            "SELECT id FROM rooms WHERE user_id = ? AND room_code = ?",
+            [userId, location]
+        );
+        const roomId = roomRows[0]?.id;
+        if (!roomId) {
+            return res.status(404).json({
+                status: "failed",
+                message: "Room not found"
+            });
+        }
 
-        const [history] = await pool.execute(`
-            SELECT at.type_code as actuator_type, acl.command_value as state, acl.command_source as control_mode, acl.executed_at as last_control_action, acl.metadata
-            FROM actuator_control_logs acl
-            JOIN actuators a ON acl.actuator_id = a.id
-            JOIN actuator_types at ON a.actuator_type_id = at.id
-            WHERE a.room_id = ? AND acl.executed_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-            ORDER BY acl.executed_at DESC
+        // Use actuator_control_logs for history (adjust columns as needed)
+        const [historyRows] = await pool.execute(`
+            SELECT 
+                actuator_id,
+                command_value AS state,
+                command_source AS control_mode,
+                executed_at AS last_control_action
+            FROM actuator_control_logs
+            WHERE actuator_id IN (
+                SELECT id FROM actuators WHERE room_id = ? AND actuator_type_id IN (1,2)  -- 1=heater, 2=cooler
+            ) AND executed_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+            ORDER BY executed_at DESC
         `, [roomId, days]);
 
         res.status(200).json({
@@ -470,10 +535,12 @@ temperatureControlRouter.get("/control-history", adminOrUser, async (req, res) =
             message: "Control history retrieved successfully",
             data: {
                 userId,
+                roomId,
                 location,
-                history
+                history: historyRows
             }
         });
+
     } catch (error) {
         console.error("Error getting control history:", error);
         res.status(500).json({
