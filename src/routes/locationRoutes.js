@@ -130,21 +130,96 @@ locationRouter.get("/locations/:location/measurements", adminOrUser, async (req,
 });
 
 // Get latest measurement for specific location
+// GET /locations/:location/latest - Get latest measurements (FIXED)
 locationRouter.get("/locations/:location/latest", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route /locations/:location/latest] GET - User: ${req.user.id}`);
     try {
         const userId = req.user.id;
         const location = decodeURIComponent(req.params.location);
 
-        const latest = await Measurement.getLatestForUser(userId, location);
+        console.log(`🔵 [Route] Getting latest measurements for: ${location}`);
 
-        console.log(`✅ [Route] Latest measurement for ${location}: ${latest ? 'Found' : 'None'}`);
+        // Get room_id first
+        const [rooms] = await pool.execute(
+            'SELECT id, room_name FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
+            [userId, location]
+        );
+
+        if (rooms.length === 0) {
+            console.warn(`⚠️ [Route] No room found for location: ${location}`);
+            return res.json({
+                status: "success",
+                message: `No room found for location: ${location}`,
+                location,
+                measurement: null
+            });
+        }
+
+        const roomId = rooms[0].id;
+        console.log(`✅ [Route] Found room_id: ${roomId}`);
+
+        // Get latest measurement for each sensor type
+        const [measurements] = await pool.execute(
+            `SELECT 
+        st.type_code,
+        sm.measured_value,
+        sm.measured_at,
+        TIMESTAMPDIFF(SECOND, sm.measured_at, NOW()) as seconds_ago
+      FROM sensor_measurements sm
+      INNER JOIN sensors s ON sm.sensor_id = s.id
+      INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+      WHERE s.user_id = ? 
+        AND s.room_id = ? 
+        AND s.is_active = 1
+        AND sm.measured_at >= NOW() - INTERVAL 1 HOUR
+      ORDER BY sm.measured_at DESC`,
+            [userId, roomId]
+        );
+
+        console.log(`✅ [Route] Found ${measurements.length} measurements`);
+
+        // Build the measurement object
+        const measurement = {
+            temperature: null,
+            humidity: null,
+            airflow: null,
+            bowl_temp: null,
+            sonar_distance: null,
+            co2_level: null,
+            sugar_level: null,
+            created_at: null
+        };
+
+        let latestTimestamp = null;
+        const processedTypes = new Set();
+
+        // Get the LATEST value for each sensor type (only once per type)
+        measurements.forEach(row => {
+            if (!processedTypes.has(row.type_code)) {
+                measurement[row.type_code] = row.measured_value;
+                processedTypes.add(row.type_code);
+
+                if (!latestTimestamp || new Date(row.measured_at) > latestTimestamp) {
+                    latestTimestamp = new Date(row.measured_at);
+                }
+
+                console.log(`✅ [Route] ${row.type_code}: ${row.measured_value} (${row.seconds_ago}s ago)`);
+            }
+        });
+
+        if (latestTimestamp) {
+            measurement.created_at = latestTimestamp;
+        }
+
+        console.log(`✅ [Route] Returning measurement:`, measurement);
+
         res.json({
             status: "success",
             message: `Latest measurement for ${location} retrieved`,
             location,
-            measurement: latest
+            measurement: measurement
         });
+
     } catch (error) {
         console.error("❌ [Route /locations/:location/latest] Error:", error.message);
         res.status(500).json({
@@ -153,6 +228,7 @@ locationRouter.get("/locations/:location/latest", adminOrUser, async (req, res) 
         });
     }
 });
+
 
 // Get all sensor data for a location
 locationRouter.get("/locations/:location/sensors", adminOrUser, async (req, res) => {
@@ -248,6 +324,10 @@ locationRouter.get("/locations/:location/control", adminOrUser, async (req, res)
         });
     }
 });
+
+// GET /locations/:location/latest - Get latest measurements (BACKWARD COMPATIBLE)
+
+
 
 // Get bowl temperature history for location
 locationRouter.get("/locations/:location/bowl-history", adminOrUser, async (req, res) => {

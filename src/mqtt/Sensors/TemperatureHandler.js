@@ -102,6 +102,12 @@ class TemperatureHandler extends BaseSensorHandler {
 
             console.log(`✅ [TemperatureHandler] Saved: ${value.toFixed(2)}°C (sensor_id: ${sensorId})`);
 
+            this.io.to(`user_${userId}`).emit('environmentUpdate', {
+                location: roomCode,
+                temperature: value,
+                timestamp: new Date().toISOString()
+            });
+
         } catch (error) {
             console.error(`❌ [TemperatureHandler] DB error:`, error.message);
         }

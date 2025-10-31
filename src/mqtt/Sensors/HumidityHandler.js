@@ -1,93 +1,118 @@
-// src/mqtt/sensors/HumidityHandler.js  
+// mqtt/sensors/HumidityHandler.js
+// ✅ UPDATED FOR redesigned_iot_database schema
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 const pool = require('../../config/db');
 
 class HumidityHandler extends BaseSensorHandler {
-    async handleHumidityData(topic, messageValue) {
+    constructor(io, sensorData, activeUsers, sensorDataMutex) {
+        super(io, sensorData, activeUsers, sensorDataMutex);
+        console.log(`🔵 [HumidityHandler] Initialized`);
+    }
+
+    async handleHumidityData(topic, payload) {
         console.log(`\n💧 ========== HUMIDITY DATA ==========`);
-        console.log(`💧 Raw value: ${messageValue}`);
+        const rawValue = parseFloat(payload);
 
-        try {
-            let validation = this.validateNumeric(messageValue, -50, 4095);
-            if (!validation.valid) {
-                console.warn(`⚠️ Invalid humidity`);
-                return;
-            }
+        if (!Number.isFinite(rawValue)) {
+            console.warn(`⚠️ [HumidityHandler] Invalid value: ${payload}`);
+            return;
+        }
 
-            let humidityValue = validation.value;
+        // Convert raw sensor value to humidity percentage
+        const humidity = (rawValue / 4095) * 100;
+        console.log(`💧 Raw value: ${rawValue}`);
+        console.log(`💧 Converted humidity: ${humidity.toFixed(1)}%`);
 
-            if (humidityValue > 1000 && humidityValue <= 4095) {
-                humidityValue = (humidityValue / 4095) * 100;
-            }
-            console.log(`💧 Converted humidity: ${humidityValue.toFixed(1)}%`);
+        // Update cache
+        this.updateCache('humidity', humidity);
 
-            await this.updateSensorCache('humidity', humidityValue);
+        console.log(`💧 [HumidityHandler] Active users: ${this.activeUsers.size}`);
 
-            if (this.activeUsers.size === 0) {
-                console.log('⏸️ No active users');
-                return;
-            }
-
-            const release = await this.sensorDataMutex.acquire();
-            let currentState;
+        // Save to database for all active users
+        for (const [userId, rooms] of this.activeUsers) {
             try {
-                currentState = {
-                    temperature: this.sensorData.temperature,
-                    humidity: this.sensorData.humidity,
-                    bowl_temp: this.sensorData.bowl_temp,
-                    sonar_distance: this.sensorData.sonar_distance,
-                    co2_level: this.sensorData.co2_level,
-                    sugar_level: this.sensorData.sugar_level
-                };
-            } finally {
-                release();
-            }
+                console.log(`🔵 [HumidityHandler] Processing user ${userId} with rooms:`, Array.from(rooms));
 
-            for (const [userId, locations] of this.activeUsers) {
-                for (const location of locations) {
-
-                    try {
-                        await pool.execute(`
-                            INSERT INTO measurements 
-                            (user_id, temperature, humidity, bowl_temp, sonar_distance, co2_level, sugar_level, airflow, location, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                            [userId, currentState.temperature, currentState.humidity, currentState.bowl_temp,
-                                currentState.sonar_distance, currentState.co2_level, currentState.sugar_level,
-                                2.0, location, new Date()]
-                        );
-                    } catch (error) {
-                        console.error(`❌ DB error:`, error.message);
-                    }
-
-                    const enriched = {
-                        temperature: currentState.temperature,
-                        humidity: currentState.humidity,
-                        bowl_temp: currentState.bowl_temp,
-                        sonar_distance: currentState.sonar_distance,
-                        co2_level: currentState.co2_level,
-                        sugar_level: currentState.sugar_level,
-                        airflow: 2.0,
-                        user_id: userId,
-                        location: location,
-                        created_at: new Date().toISOString()
-                    };
-
-                    // ✅ Emit BOTH events
-                    this.io.to(`location_${location}`).emit("newMeasurement", enriched);
-                    this.io.to(`user_${userId}`).emit("newMeasurement", enriched);
-
-                    // ✅ ADD THIS - environmentUpdate for CurrentEnvironment
-                    this.io.to(`location_${location}`).emit("environmentUpdate", enriched);
-                    this.io.to(`user_${userId}`).emit("environmentUpdate", enriched);
-
-                    console.log(`📡 Emitted to user ${userId}`);
+                for (const roomCode of rooms) {
+                    await this.saveToDB(userId, roomCode, topic, humidity);
                 }
+
+                // Emit to user's socket
+                this.io.to(`user_${userId}`).emit('humidityUpdate', {
+                    humidity: humidity,
+                    timestamp: new Date(),
+                    source: topic
+                });
+                console.log(`📡 [HumidityHandler] Emitted to user ${userId}`);
+
+            } catch (error) {
+                console.error(`❌ [HumidityHandler] Error for user ${userId}:`, error.message);
+            }
+        }
+
+        console.log(`💧 ========== END HUMIDITY DATA ==========\n`);
+    }
+
+    async saveToDB(userId, roomCode, mqttTopic, value) {
+        try {
+            console.log(`🔵 [HumidityHandler] Saving - User: ${userId}, Room: ${roomCode}`);
+
+            // Get room_id
+            const [rooms] = await pool.execute(
+                'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
+                [userId, roomCode]
+            );
+
+            if (rooms.length === 0) {
+                console.warn(`⚠️ [HumidityHandler] No room found for user ${userId}, room_code: ${roomCode}`);
+                return;
             }
 
-            console.log(`💧 ========== END HUMIDITY DATA ==========\n`);
+            const roomId = rooms[0].id;
+            console.log(`✅ [HumidityHandler] Found room_id: ${roomId}`);
+
+            // Get humidity sensor
+            const [sensors] = await pool.execute(
+                `SELECT s.id FROM sensors s
+         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+         WHERE s.user_id = ? 
+         AND s.room_id = ? 
+         AND st.type_code = 'humidity'
+         AND s.is_active = 1
+         LIMIT 1`,
+                [userId, roomId]
+            );
+
+            if (sensors.length === 0) {
+                console.warn(`⚠️ [HumidityHandler] No humidity sensor found in room ${roomId}`);
+                return;
+            }
+
+            const sensorId = sensors[0].id;
+            console.log(`✅ [HumidityHandler] Found sensor_id: ${sensorId}`);
+
+            // Insert measurement
+            await pool.execute(
+                'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
+                [sensorId, value]
+            );
+
+            // Update last_reading_at
+            await pool.execute(
+                'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
+                [sensorId]
+            );
+
+            console.log(`✅ [HumidityHandler] Saved: ${value.toFixed(2)}% (sensor_id: ${sensorId})`);
+
+            this.io.to(`user_${userId}`).emit('environmentUpdate', {
+                location: roomCode,
+                humidity: value,
+                timestamp: new Date().toISOString()
+            });
 
         } catch (error) {
-            console.error(`❌ Humidity error:`, error);
+            console.error(`❌ [HumidityHandler] DB error:`, error.message);
         }
     }
 }
