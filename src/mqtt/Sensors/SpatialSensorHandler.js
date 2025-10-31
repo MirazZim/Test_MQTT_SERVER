@@ -1,20 +1,27 @@
-// src/mqtt/sensors/SpatialSensorHandler.js
+// mqtt/sensors/SpatialSensorHandler.js
+// ✅ UPDATED FOR redesigned_iot_database schema
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 
 class SpatialSensorHandler extends BaseSensorHandler {
-    async handleSpatialSensorData(topic, message) {
-        try {
-            const data = JSON.parse(message.toString());
-            console.log(`📡 Spatial sensor data: ${topic}`, data);
+    constructor(io, sensorData, activeUsers, sensorDataMutex) {
+        super(io, sensorData, activeUsers, sensorDataMutex);
+        console.log(`🔵 [SpatialSensorHandler] Initialized`);
+    }
 
-            this.io.emit("spatialSensorData", {
-                topic,
-                data,
-                timestamp: new Date()
-            });
+    async handleSpatialData(sensorId, x, y, value, type) {
+        console.log(`📍 [SpatialSensorHandler] Sensor ${sensorId} at (${x},${y}): ${value} ${type}`);
 
-        } catch (error) {
-            console.error(`❌ Error handling spatial sensor:`, error);
+        const spatialData = {
+            sensorId,
+            x,
+            y,
+            value,
+            type,
+            timestamp: new Date()
+        };
+
+        for (const [userId] of this.activeUsers) {
+            this.io.to(`user_${userId}`).emit('spatialSensorUpdate', spatialData);
         }
     }
 }

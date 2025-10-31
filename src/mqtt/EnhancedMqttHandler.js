@@ -3,6 +3,7 @@
 const { Mutex } = require("async-mutex");
 const MqttConnection = require('./connection/MqttConnection');
 const pool = require('../config/db');
+
 const TemperatureHandler = require('./sensors/TemperatureHandler');
 const HumidityHandler = require('./sensors/HumidityHandler');
 const BowlTemperatureHandler = require('./sensors/BowlTemperatureHandler');
@@ -14,7 +15,7 @@ const CO2FermentationHandler = require('./sensors/CO2FermentationHandler');
 const SugarHandler = require('./sensors/SugarHandler');
 const SugarFermentationHandler = require('./sensors/SugarFermentationHandler');
 const ESP3Handler = require('./sensors/ESP3Handler');
-const RealSensorHandler = require('./Sensors/RealSensorHandler');
+const RealSensorHandler = require('./sensors/RealSensorHandler');
 
 class EnhancedMqttHandler {
     constructor(io) {
@@ -53,7 +54,7 @@ class EnhancedMqttHandler {
         this.esp3Handler = new ESP3Handler(...handlerArgs);
         this.realSensorHandler = new RealSensorHandler(...handlerArgs);
 
-        console.log(`✅ [EnhancedMqttHandler] Initialized with ${Object.keys(handlerArgs).length} handlers`);
+        console.log(`✅ [EnhancedMqttHandler] Initialized with all handlers`);
     }
 
     connect() {
@@ -94,57 +95,73 @@ class EnhancedMqttHandler {
         const payload = message.toString();
         console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${payload}`);
 
-        // Check if it's a dynamic topic (format: user_id/room_code/sensor_type)
-        const dynamicTopicParts = topic.split('/');
-        if (dynamicTopicParts.length === 3 && !isNaN(dynamicTopicParts[0])) {
-            // This is a dynamic topic
-            await this.handleDynamicTopic(topic, payload);
-            return;
-        }
+        try {
+            // Check if it's a dynamic topic (format: user_id/room_code/sensor_type)
+            const dynamicTopicParts = topic.split('/');
+            if (dynamicTopicParts.length === 3 && !isNaN(dynamicTopicParts[0])) {
+                // This is a dynamic topic
+                await this.handleDynamicTopic(topic, payload);
+                return;
+            }
 
-        // Handle legacy topics
-        switch (topic) {
-            case 'ESP2':
-                await this.temperatureHandler.handleTemperatureData(topic, payload);
-                await this.realSensorHandler.handleRealSensorData(topic, payload);
-                break;
-            case 'ESP':
-                await this.humidityHandler.handleHumidityData(topic, payload);
-                break;
-            case 'bowl':
-                await this.bowlTemperatureHandler.handleBowlTemperature(topic, payload);
-                break;
-            case 'bowlT':
-                await this.bowlFanHandler.handleBowlFanStatus(topic, payload);
-                break;
-            case 'sonar':
-                await this.sonarDistanceHandler.handleSonarDistance(topic, payload);
-                break;
-            case 'sonarT':
-                await this.sonarPumpHandler.handleSonarPumpStatus(topic, payload);
-                break;
-            case 'CO2':
-                await this.co2Handler.handleCO2Data(topic, payload);
-                break;
-            case 'CO2T':
-                await this.co2FermentationHandler.handleCO2FermentationStatus(topic, payload);
-                break;
-            case 'sugar':
-                await this.sugarHandler.handleSugarData(topic, payload);
-                break;
-            case 'sugarT':
-                await this.sugarFermentationHandler.handleSugarFermentationStatus(topic, payload);
-                break;
-            case 'ESP3':
-                await this.esp3Handler.handleESP3Data(topic, payload);
-                break;
-            case 'ESPX':
-            case 'ESPX2':
-            case 'ESPX3':
-                await this.realSensorHandler.handleRealSensorData(topic, payload);
-                break;
-            default:
-                console.warn(`⚠️ [EnhancedMqttHandler] Unhandled topic: ${topic}`);
+            // Handle legacy topics
+            switch (topic) {
+                case 'ESP2':
+                    await this.temperatureHandler.handleTemperatureData(topic, payload);
+                    await this.realSensorHandler.handleRealSensorData(topic, payload);
+                    break;
+
+                case 'ESP':
+                    await this.humidityHandler.handleHumidityData(topic, payload);
+                    break;
+
+                case 'bowl':
+                    await this.bowlTemperatureHandler.handleBowlTemperatureData(topic, payload); // ✅ FIXED
+                    break;
+
+                case 'bowlT':
+                    await this.bowlFanHandler.handleBowlFanData(topic, payload); // ✅ FIXED
+                    break;
+
+                case 'sonar':
+                    await this.sonarDistanceHandler.handleSonarData(topic, payload); // ✅ FIXED
+                    break;
+
+                case 'sonarT':
+                    await this.sonarPumpHandler.handleSonarPumpData(topic, payload); // ✅ FIXED
+                    break;
+
+                case 'CO2':
+                    await this.co2Handler.handleCO2Data(topic, payload);
+                    break;
+
+                case 'CO2T':
+                    await this.co2FermentationHandler.handleCO2FermentationData(topic, payload); // ✅ FIXED
+                    break;
+
+                case 'sugar':
+                    await this.sugarHandler.handleSugarData(topic, payload);
+                    break;
+
+                case 'sugarT':
+                    await this.sugarFermentationHandler.handleSugarFermentationData(topic, payload); // ✅ FIXED
+                    break;
+
+                case 'ESP3':
+                    await this.esp3Handler.handleESP3Data(topic, payload);
+                    break;
+
+                case 'ESPX':
+                case 'ESPX2':
+                case 'ESPX3':
+                    await this.realSensorHandler.handleRealSensorData(topic, payload);
+                    break;
+
+                default:
+                    console.warn(`⚠️ [EnhancedMqttHandler] Unhandled topic: ${topic}`);
+            }
+        } catch (error) {
+            console.error(`❌ [EnhancedMqttHandler] Error processing ${topic}:`, error.message);
         }
     }
 
@@ -204,6 +221,7 @@ class EnhancedMqttHandler {
                 timestamp: new Date(),
                 topic: topic
             });
+
             console.log(`📡 [EnhancedMqttHandler] Emitted sensorUpdate to user_${sensor.user_id}`);
 
         } catch (error) {

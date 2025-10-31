@@ -1,39 +1,28 @@
-// src/mqtt/sensors/SugarFermentationHandler.js
+// SugarFermentationHandler.js - SIMPLE VERSION
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 
 class SugarFermentationHandler extends BaseSensorHandler {
-    async handleSugarFermentationStatus(topic, messageValue) {
-        console.log(`\n🍬⚗️ ========== SUGAR FERMENTATION ==========`);
-        console.log(`🍬⚗️ Value: ${messageValue}`);
-        console.log(`🍬⚗️ Active users: ${this.activeUsers.size}`);
+    constructor(io, sensorData, activeUsers, sensorDataMutex) {
+        super(io, sensorData, activeUsers, sensorDataMutex);
+        console.log(`🔵 [SugarFermentationHandler] Initialized`);
+    }
 
-        try {
-            const status = messageValue.toString().trim();
-            await this.updateSensorCache('sugar_fermentation_status', status);
+    async handleSugarFermentationData(topic, payload) {
+        console.log(`\n🍯 ========== SUGAR FERMENTATION ==========`);
+        console.log(`🍯 Payload received: ${payload}`);
 
-            let statusMessage = status === 'FFC' ? 'Fermentation Complete' : 'Fermentation Closed';
-            let fermentationComplete = status === 'FFC';
+        // ✅ Send as-is without validation
+        this.updateCache('sugar_fermentation', payload);
 
-            console.log(`🍬 Status: ${statusMessage}`);
-
-            for (const [userId, locations] of this.activeUsers) {
-                for (const location of locations) {
-                    const payload = {
-                        status,
-                        message: statusMessage,
-                        fermentationComplete,
-                        location
-                    };
-
-                    this.io.to(`location_${location}`).emit('sugarFermentationStatus', payload);
-                    this.io.to(`user_${userId}`).emit('sugarFermentationStatus', payload);
-                }
-            }
-
-            console.log(`🍬⚗️ ========== END SUGAR FERMENTATION ==========\n`);
-        } catch (error) {
-            console.error(`❌ Error handling sugar fermentation:`, error);
+        for (const [userId] of this.activeUsers) {
+            this.io.to(`user_${userId}`).emit('sugarFermentationUpdate', {
+                value: payload,
+                timestamp: new Date()
+            });
+            console.log(`📡 [SugarFermentationHandler] Emitted to user ${userId}`);
         }
+
+        console.log(`🍯 ========== END SUGAR FERMENTATION ==========\n`);
     }
 }
 

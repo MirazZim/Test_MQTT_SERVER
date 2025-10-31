@@ -1,39 +1,28 @@
-// src/mqtt/sensors/CO2FermentationHandler.js
+// CO2FermentationHandler.js - SIMPLE VERSION
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 
 class CO2FermentationHandler extends BaseSensorHandler {
-    async handleCO2FermentationStatus(topic, messageValue) {
-        console.log(`\n🫧⚗️ ========== CO2 FERMENTATION ==========`);
-        console.log(`🫧⚗️ Value: ${messageValue}`);
-        console.log(`🫧⚗️ Active users: ${this.activeUsers.size}`);
+    constructor(io, sensorData, activeUsers, sensorDataMutex) {
+        super(io, sensorData, activeUsers, sensorDataMutex);
+        console.log(`🔵 [CO2FermentationHandler] Initialized`);
+    }
 
-        try {
-            const status = messageValue.toString().trim();
-            await this.updateSensorCache('co2_fermentation_status', status);
+    async handleCO2FermentationData(topic, payload) {
+        console.log(`\n🫧 ========== CO2 FERMENTATION ==========`);
+        console.log(`🫧 Payload received: ${payload}`);
 
-            let statusMessage = status === 'AF' ? 'Fermentation Going' : 'Fermentation is OFF, Something is Wrong';
-            let fermentationActive = status === 'AF';
+        // ✅ Send as-is without validation
+        this.updateCache('co2_fermentation', payload);
 
-            console.log(`🫧 Status: ${statusMessage}`);
-
-            for (const [userId, locations] of this.activeUsers) {
-                for (const location of locations) {
-                    const payload = {
-                        status,
-                        message: statusMessage,
-                        fermentationActive,
-                        location
-                    };
-
-                    this.io.to(`location_${location}`).emit('co2FermentationStatus', payload);
-                    this.io.to(`user_${userId}`).emit('co2FermentationStatus', payload);
-                }
-            }
-
-            console.log(`🫧⚗️ ========== END CO2 FERMENTATION ==========\n`);
-        } catch (error) {
-            console.error(`❌ Error handling CO2 fermentation:`, error);
+        for (const [userId] of this.activeUsers) {
+            this.io.to(`user_${userId}`).emit('co2FermentationUpdate', {
+                value: payload,
+                timestamp: new Date()
+            });
+            console.log(`📡 [CO2FermentationHandler] Emitted to user ${userId}`);
         }
+
+        console.log(`🫧 ========== END CO2 FERMENTATION ==========\n`);
     }
 }
 

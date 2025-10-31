@@ -1,81 +1,101 @@
-// src/mqtt/sensors/BowlTemperatureHandler.js
+// mqtt/sensors/BowlTemperatureHandler.js
+// ✅ UPDATED FOR redesigned_iot_database schema
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 const pool = require('../../config/db');
 
 class BowlTemperatureHandler extends BaseSensorHandler {
-    async handleBowlTemperature(topic, messageValue) {
-        console.log(`\n🥣 ========== BOWL TEMPERATURE ==========`);
-        console.log(`🥣 Value: ${messageValue}`);
-        console.log(`🥣 Active users: ${this.activeUsers.size}`);
+    constructor(io, sensorData, activeUsers, sensorDataMutex) {
+        super(io, sensorData, activeUsers, sensorDataMutex);
+        console.log(`🔵 [BowlTemperatureHandler] Initialized`);
+    }
 
+    async handleBowlTemperatureData(topic, payload) {
+        console.log(`\n🍲 ========== BOWL TEMPERATURE DATA ==========`);
+        const value = parseFloat(payload);
+
+        if (!Number.isFinite(value)) {
+            console.warn(`⚠️ [BowlTemperatureHandler] Invalid value: ${payload}`);
+            return;
+        }
+
+        console.log(`🍲 Bowl temperature: ${value.toFixed(2)}°C`);
+        this.updateCache('bowl_temp', value);
+
+        console.log(`🍲 [BowlTemperatureHandler] Active users: ${this.activeUsers.size}`);
+
+        for (const [userId, rooms] of this.activeUsers) {
+            try {
+                console.log(`🔵 [BowlTemperatureHandler] Processing user ${userId} with rooms:`, Array.from(rooms));
+
+                for (const roomCode of rooms) {
+                    await this.saveToDB(userId, roomCode, topic, value);
+                }
+
+                this.io.to(`user_${userId}`).emit('bowlTemperatureUpdate', {
+                    bowl_temp: value,
+                    timestamp: new Date(),
+                    source: topic
+                });
+                console.log(`📡 [BowlTemperatureHandler] Emitted to user ${userId}`);
+
+            } catch (error) {
+                console.error(`❌ [BowlTemperatureHandler] Error for user ${userId}:`, error.message);
+            }
+        }
+
+        console.log(`🍲 ========== END BOWL TEMPERATURE DATA ==========\n`);
+    }
+
+    async saveToDB(userId, roomCode, mqttTopic, value) {
         try {
-            const validation = this.validateNumeric(messageValue);
-            if (!validation.valid) return;
+            console.log(`🔵 [BowlTemperatureHandler] Saving - User: ${userId}, Room: ${roomCode}`);
 
-            const value = validation.value;
-            await this.updateSensorCache('bowl_temp', value);
+            const [rooms] = await pool.execute(
+                'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
+                [userId, roomCode]
+            );
 
-            if (this.activeUsers.size === 0) {
-                console.log('⏸️ No active users');
+            if (rooms.length === 0) {
+                console.warn(`⚠️ [BowlTemperatureHandler] No room found for user ${userId}, room_code: ${roomCode}`);
                 return;
             }
 
-            const release = await this.sensorDataMutex.acquire();
-            let currentState;
-            try {
-                currentState = {
-                    temperature: this.sensorData.temperature,
-                    humidity: this.sensorData.humidity,
-                    bowl_temp: this.sensorData.bowl_temp,
-                    sonar_distance: this.sensorData.sonar_distance,
-                    co2_level: this.sensorData.co2_level,
-                    sugar_level: this.sensorData.sugar_level
-                };
-            } finally {
-                release();
+            const roomId = rooms[0].id;
+            console.log(`✅ [BowlTemperatureHandler] Found room_id: ${roomId}`);
+
+            const [sensors] = await pool.execute(
+                `SELECT s.id FROM sensors s
+         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+         WHERE s.user_id = ? 
+         AND s.room_id = ? 
+         AND st.type_code = 'bowl_temp'
+         AND s.is_active = 1
+         LIMIT 1`,
+                [userId, roomId]
+            );
+
+            if (sensors.length === 0) {
+                console.warn(`⚠️ [BowlTemperatureHandler] No bowl_temp sensor found in room ${roomId}`);
+                return;
             }
 
-            for (const [userId, locations] of this.activeUsers) {
-                for (const location of locations) {
-                    try {
-                        await pool.execute(`
-                            INSERT INTO measurements 
-                            (user_id, temperature, humidity, bowl_temp, sonar_distance, co2_level, sugar_level, airflow, location, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                            [userId, currentState.temperature, currentState.humidity, currentState.bowl_temp,
-                                currentState.sonar_distance, currentState.co2_level, currentState.sugar_level,
-                                2.0, location, new Date()]
-                        );
-                        console.log(`✅ Stored Bowl for user ${userId}`);
-                    } catch (error) {
-                        console.error(`❌ DB error:`, error.message);
-                    }
+            const sensorId = sensors[0].id;
+            console.log(`✅ [BowlTemperatureHandler] Found sensor_id: ${sensorId}`);
 
-                    const enriched = {
-                        temperature: currentState.temperature,
-                        humidity: currentState.humidity,
-                        bowl_temp: currentState.bowl_temp,
-                        sonar_distance: currentState.sonar_distance,
-                        co2_level: currentState.co2_level,
-                        sugar_level: currentState.sugar_level,
-                        airflow: 2.0,
-                        user_id: userId,
-                        location: location,
-                        created_at: new Date().toISOString()
-                    };
+            await pool.execute(
+                'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
+                [sensorId, value]
+            );
 
-                    this.io.to(`location_${location}`).emit("newMeasurement", enriched);
-                    this.io.to(`user_${userId}`).emit("newMeasurement", enriched);
-                    this.io.to(`location_${location}`).emit("environmentUpdate", enriched);
-                    this.io.to(`user_${userId}`).emit("environmentUpdate", enriched);
+            await pool.execute(
+                'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
+                [sensorId]
+            );
 
-                    console.log(`📡 Bowl emitted to user ${userId}`);
-                }
-            }
+            console.log(`✅ [BowlTemperatureHandler] Saved: ${value.toFixed(2)}°C (sensor_id: ${sensorId})`);
 
-            console.log(`🥣 ========== END BOWL TEMPERATURE ==========\n`);
         } catch (error) {
-            console.error(`❌ Error handling bowl temp:`, error);
+            console.error(`❌ [BowlTemperatureHandler] DB error:`, error.message);
         }
     }
 }
