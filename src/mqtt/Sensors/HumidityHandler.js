@@ -1,5 +1,4 @@
 // mqtt/sensors/HumidityHandler.js
-// ✅ UPDATED FOR redesigned_iot_database schema
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 const pool = require('../../config/db');
 
@@ -11,105 +10,97 @@ class HumidityHandler extends BaseSensorHandler {
 
     async handleHumidityData(topic, payload) {
         console.log(`\n💧 ========== HUMIDITY DATA ==========`);
-        const rawValue = parseFloat(payload);
+        console.log(`💧 Raw value: ${payload}`);
 
-        if (!Number.isFinite(rawValue)) {
+        const value = parseFloat(payload);
+        if (!Number.isFinite(value)) {
             console.warn(`⚠️ [HumidityHandler] Invalid value: ${payload}`);
             return;
         }
 
-        // Convert raw sensor value to humidity percentage
-        const humidity = (rawValue / 4095) * 100;
-        console.log(`💧 Raw value: ${rawValue}`);
-        console.log(`💧 Converted humidity: ${humidity.toFixed(1)}%`);
+        // ESP specific conversion
+        const humidityPercentage = (value / 4095) * 100;
+        console.log(`💧 Converted humidity: ${humidityPercentage.toFixed(1)}%`);
 
-        // Update cache
-        this.updateCache('humidity', humidity);
-
+        this.updateCache('humidity', humidityPercentage);
         console.log(`💧 [HumidityHandler] Active users: ${this.activeUsers.size}`);
 
-        // Save to database for all active users
+        // ✅ FIX: Emit sensorData for chart updates
+        try {
+            const [sensors] = await pool.execute(
+                'SELECT id, user_id FROM sensors WHERE mqtt_topic = ? AND is_active = 1',
+                [topic]
+            );
+
+            if (sensors.length > 0) {
+                const sensor = sensors[0];
+                this.io.to(`sensor_${sensor.id}`).emit('sensorData', {
+                    sensorId: sensor.id,
+                    value: humidityPercentage,
+                    timestamp: new Date().toISOString(),
+                    quality: 'good'
+                });
+                console.log(`📡 [HumidityHandler] Emitted to sensor_${sensor.id}: ${humidityPercentage.toFixed(1)}%`);
+            }
+        } catch (error) {
+            console.error(`❌ [HumidityHandler] Error emitting sensorData:`, error.message);
+        }
+
+        // Process for active users
         for (const [userId, rooms] of this.activeUsers) {
             try {
-                console.log(`🔵 [HumidityHandler] Processing user ${userId} with rooms:`, Array.from(rooms));
-
                 for (const roomCode of rooms) {
-                    await this.saveToDB(userId, roomCode, topic, humidity);
+                    await this.saveToDB(userId, roomCode, topic, humidityPercentage);
                 }
 
-                // Emit to user's socket
                 this.io.to(`user_${userId}`).emit('humidityUpdate', {
-                    humidity: humidity,
+                    humidity: humidityPercentage,
                     timestamp: new Date(),
                     source: topic
                 });
-                console.log(`📡 [HumidityHandler] Emitted to user ${userId}`);
 
             } catch (error) {
                 console.error(`❌ [HumidityHandler] Error for user ${userId}:`, error.message);
             }
         }
-
         console.log(`💧 ========== END HUMIDITY DATA ==========\n`);
     }
 
     async saveToDB(userId, roomCode, mqttTopic, value) {
         try {
-            console.log(`🔵 [HumidityHandler] Saving - User: ${userId}, Room: ${roomCode}`);
-
-            // Get room_id
             const [rooms] = await pool.execute(
                 'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
                 [userId, roomCode]
             );
 
-            if (rooms.length === 0) {
-                console.warn(`⚠️ [HumidityHandler] No room found for user ${userId}, room_code: ${roomCode}`);
-                return;
-            }
+            if (rooms.length === 0) return;
 
             const roomId = rooms[0].id;
-            console.log(`✅ [HumidityHandler] Found room_id: ${roomId}`);
 
-            // Get humidity sensor
             const [sensors] = await pool.execute(
-                `SELECT s.id FROM sensors s
-         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-         WHERE s.user_id = ? 
-         AND s.room_id = ? 
-         AND st.type_code = 'humidity'
-         AND s.is_active = 1
-         LIMIT 1`,
-                [userId, roomId]
+                `SELECT id FROM sensors 
+                 WHERE user_id = ? 
+                 AND room_id = ? 
+                 AND mqtt_topic = ? 
+                 AND is_active = 1`,
+                [userId, roomId, mqttTopic]
             );
 
-            if (sensors.length === 0) {
-                console.warn(`⚠️ [HumidityHandler] No humidity sensor found in room ${roomId}`);
-                return;
-            }
+            if (sensors.length === 0) return;
 
             const sensorId = sensors[0].id;
-            console.log(`✅ [HumidityHandler] Found sensor_id: ${sensorId}`);
 
-            // Insert measurement
             await pool.execute(
                 'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
                 [sensorId, value]
             );
 
-            // Update last_reading_at
             await pool.execute(
                 'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
                 [sensorId]
             );
 
-            console.log(`✅ [HumidityHandler] Saved: ${value.toFixed(2)}% (sensor_id: ${sensorId})`);
-
-            this.io.to(`user_${userId}`).emit('environmentUpdate', {
-                location: roomCode,
-                humidity: value,
-                timestamp: new Date().toISOString()
-            });
+            console.log(`✅ [HumidityHandler] Saved: ${value.toFixed(1)}% (sensor_id: ${sensorId})`);
 
         } catch (error) {
             console.error(`❌ [HumidityHandler] DB error:`, error.message);

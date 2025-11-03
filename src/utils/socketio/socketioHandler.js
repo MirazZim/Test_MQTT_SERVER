@@ -104,32 +104,6 @@ const createSocketIOServer = (server) => {
             }
         });
 
-        socket.on("requestChartData", async ({ location, days = 7 }) => {
-            try {
-                const [measurements] = await pool.execute(`
-                    SELECT temperature, humidity, airflow, created_at
-                    FROM measurements
-                    WHERE location = ?
-                    AND created_at >= NOW() - INTERVAL ? DAY
-                    AND user_id = ?
-                    ORDER BY created_at ASC
-                    LIMIT 1000
-                `, [location, days, userId]);
-
-                socket.emit('chartDataUpdate', {
-                    location,
-                    measurements: measurements
-                });
-                console.log(`📊 Sent ${measurements.length} chart data points for ${location} to user ${userId}`);
-            } catch (error) {
-                console.error('Error fetching chart data:', error);
-                socket.emit('chartError', {
-                    location,
-                    message: error.message
-                });
-            }
-        });
-
         socket.on('sendActuatorCommand', (data) => {
             const { userId, location, command } = data;
             console.log(`🎛️ Actuator command: ${command} for user ${userId} in ${location}`);
@@ -175,6 +149,59 @@ const createSocketIOServer = (server) => {
                 });
             }
         });
+
+        // Updated chart data request handler
+        socket.on("requestChartData", async ({ sensorId, period = "24h" }) => {
+            try {
+                const periodMap = {
+                    "1h": "1 HOUR",
+                    "6h": "6 HOUR",
+                    "24h": "24 HOUR",
+                    "7d": "7 DAY",
+                    "30d": "30 DAY"
+                };
+                const interval = periodMap[period] || "24 HOUR";
+
+                const [measurements] = await pool.execute(`
+      SELECT 
+        sm.measured_value as value,
+        sm.measured_at as timestamp,
+        sm.quality_indicator,
+        s.sensor_name,
+        st.unit
+      FROM sensor_measurements sm
+      JOIN sensors s ON sm.sensor_id = s.id
+      JOIN sensor_types st ON s.sensor_type_id = st.id
+      WHERE sm.sensor_id = ?
+      AND s.user_id = ?
+      AND sm.measured_at >= NOW() - INTERVAL ${interval}
+      ORDER BY sm.measured_at ASC
+      LIMIT 10000
+    `, [sensorId, userId]);
+
+                socket.emit('chartDataUpdate', {
+                    sensorId,
+                    measurements: measurements.map(m => ({
+                        timestamp: m.timestamp,
+                        value: parseFloat(m.value),
+                        quality: m.quality_indicator
+                    }))
+                });
+            } catch (error) {
+                socket.emit('chartError', { sensorId, message: error.message });
+            }
+        });
+
+        socket.on('joinSensor', (sensorId) => {
+            socket.join(`sensor_${sensorId}`);
+            console.log(`📊 User ${userId} joined sensor room: sensor_${sensorId}`);
+        });
+
+        socket.on('leaveSensor', (sensorId) => {
+            socket.leave(`sensor_${sensorId}`);
+            console.log(`📊 User ${userId} left sensor room: sensor_${sensorId}`);
+        });
+
 
         // Join location-specific rooms (when user selects locations)
         socket.on("joinLocation", (location) => {

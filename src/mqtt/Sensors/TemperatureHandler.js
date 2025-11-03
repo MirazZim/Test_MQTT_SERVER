@@ -27,6 +27,27 @@ class TemperatureHandler extends BaseSensorHandler {
         this.updateCache('temperature', adjustedValue);
         console.log(`🌡️ [TemperatureHandler] Active users: ${this.activeUsers.size}`);
 
+        // ✅ FIX: Emit sensorData for chart updates FIRST (before user loop)
+        try {
+            const [sensors] = await pool.execute(
+                'SELECT id, user_id FROM sensors WHERE mqtt_topic = ? AND is_active = 1',
+                [topic]
+            );
+
+            if (sensors.length > 0) {
+                const sensor = sensors[0];
+                this.io.to(`sensor_${sensor.id}`).emit('sensorData', {
+                    sensorId: sensor.id,
+                    value: adjustedValue, // Use adjusted value, not raw payload
+                    timestamp: new Date().toISOString(),
+                    quality: 'good'
+                });
+                console.log(`📡 [TemperatureHandler] Emitted to sensor_${sensor.id}: ${adjustedValue.toFixed(2)}`);
+            }
+        } catch (error) {
+            console.error(`❌ [TemperatureHandler] Error emitting sensorData:`, error.message);
+        }
+
         // Save to database and emit for all active users
         for (const [userId, rooms] of this.activeUsers) {
             try {
@@ -43,7 +64,7 @@ class TemperatureHandler extends BaseSensorHandler {
                     timestamp: new Date(),
                     source: topic
                 });
-                console.log(`📡 [TemperatureHandler] Emitted to user_${userId}`);
+                console.log(`📡 [TemperatureHandler] Emitted temperatureUpdate to user_${userId}`);
 
             } catch (error) {
                 console.error(`❌ [TemperatureHandler] Error for user ${userId}:`, error.message);
@@ -73,10 +94,10 @@ class TemperatureHandler extends BaseSensorHandler {
             // Get sensor_id by mqtt_topic (DYNAMIC TOPIC MATCHING)
             const [sensors] = await pool.execute(
                 `SELECT id FROM sensors 
-         WHERE user_id = ? 
-         AND room_id = ? 
-         AND mqtt_topic = ? 
-         AND is_active = 1`,
+                 WHERE user_id = ? 
+                 AND room_id = ? 
+                 AND mqtt_topic = ? 
+                 AND is_active = 1`,
                 [userId, roomId, mqttTopic]
             );
 
@@ -102,6 +123,7 @@ class TemperatureHandler extends BaseSensorHandler {
 
             console.log(`✅ [TemperatureHandler] Saved: ${value.toFixed(2)}°C (sensor_id: ${sensorId})`);
 
+            // Emit environment update for dashboard
             this.io.to(`user_${userId}`).emit('environmentUpdate', {
                 location: roomCode,
                 temperature: value,

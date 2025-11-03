@@ -56,15 +56,37 @@ class EnhancedMqttHandler {
 
         console.log(`✅ [EnhancedMqttHandler] Initialized with all handlers`);
     }
+    setupSocketHandlers() {
+        this.io.on('connection', (socket) => {
+            console.log(`🔌 Client connected: ${socket.id}`);
 
+            // Handle sensor room subscriptions
+            socket.on('joinRoom', (room) => {
+                socket.join(room);
+                console.log(`✅ Socket ${socket.id} joined room: ${room}`);
+            });
+
+            socket.on('leaveRoom', (room) => {
+                socket.leave(room);
+                console.log(`❌ Socket ${socket.id} left room: ${room}`);
+            });
+
+            socket.on('disconnect', () => {
+                console.log(`🔌 Client disconnected: ${socket.id}`);
+            });
+        });
+    }
     connect() {
         console.log(`🔵 [EnhancedMqttHandler] Connecting to MQTT broker...`);
+        this.setupSocketHandlers();
         this.mqttConnection.connect(
             (client) => this.onConnect(client),
             (topic, message) => this.onMessage(topic, message),
             (error) => this.onError(error)
         );
     }
+
+
 
     onConnect(client) {
         console.log(`🔵 [EnhancedMqttHandler] Connected to MQTT broker`);
@@ -165,7 +187,7 @@ class EnhancedMqttHandler {
         }
     }
 
-    // ✅ NEW METHOD: Handle dynamic MQTT topics
+    // In EnhancedMqttHandler.js - Update the handleDynamicTopic method
     async handleDynamicTopic(topic, payload) {
         try {
             console.log(`🔵 [EnhancedMqttHandler] Handling dynamic topic: ${topic}`);
@@ -173,10 +195,10 @@ class EnhancedMqttHandler {
             // Find the sensor by mqtt_topic
             const [sensors] = await pool.execute(
                 `SELECT s.*, st.type_code, st.type_name, r.room_code, r.room_name
-         FROM sensors s
-         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-         INNER JOIN rooms r ON s.room_id = r.id
-         WHERE s.mqtt_topic = ? AND s.is_active = 1`,
+             FROM sensors s
+             INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+             LEFT JOIN rooms r ON s.room_id = r.id
+             WHERE s.mqtt_topic = ? AND s.is_active = 1`,
                 [topic]
             );
 
@@ -198,7 +220,7 @@ class EnhancedMqttHandler {
             // Insert measurement
             await pool.execute(
                 `INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator)
-         VALUES (?, ?, NOW(3), 100)`,
+             VALUES (?, ?, NOW(3), 100)`,
                 [sensor.id, value]
             );
 
@@ -210,7 +232,10 @@ class EnhancedMqttHandler {
 
             console.log(`✅ [EnhancedMqttHandler] Saved measurement: ${value} for sensor ${sensor.sensor_name}`);
 
-            // Emit Socket.IO event to user
+            // ✅ FIX: Emit to BOTH user room AND sensor-specific room
+            const timestamp = new Date().toISOString();
+
+            // Emit to user room (for dashboard)
             this.io.to(`user_${sensor.user_id}`).emit('sensorUpdate', {
                 sensorId: sensor.id,
                 sensorType: sensor.type_code,
@@ -218,11 +243,19 @@ class EnhancedMqttHandler {
                 roomCode: sensor.room_code,
                 roomName: sensor.room_name,
                 value: value,
-                timestamp: new Date(),
+                timestamp: timestamp,
                 topic: topic
             });
 
-            console.log(`📡 [EnhancedMqttHandler] Emitted sensorUpdate to user_${sensor.user_id}`);
+            // ✅ FIX: Emit to sensor-specific room (for charts)
+            this.io.to(`sensor_${sensor.id}`).emit('sensorData', {
+                sensorId: sensor.id,
+                value: value,
+                timestamp: timestamp,
+                quality: 'good'
+            });
+
+            console.log(`📡 [EnhancedMqttHandler] Emitted to user_${sensor.user_id} and sensor_${sensor.id}`);
 
         } catch (error) {
             console.error(`❌ [EnhancedMqttHandler] Error handling dynamic topic:`, error.message);
