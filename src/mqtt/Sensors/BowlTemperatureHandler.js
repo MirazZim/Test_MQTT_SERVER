@@ -1,5 +1,3 @@
-// mqtt/sensors/BowlTemperatureHandler.js
-// ✅ UPDATED FOR redesigned_iot_database schema
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 const pool = require('../../config/db');
 
@@ -20,6 +18,27 @@ class BowlTemperatureHandler extends BaseSensorHandler {
 
         console.log(`🍲 Bowl temperature: ${value.toFixed(2)}°C`);
         this.updateCache('bowl_temp', value);
+
+        // ✅ FIX: Emit sensorData for chart updates
+        try {
+            const [sensors] = await pool.execute(
+                'SELECT id, user_id FROM sensors WHERE mqtt_topic = ? AND is_active = 1',
+                [topic]
+            );
+
+            if (sensors.length > 0) {
+                const sensor = sensors[0];
+                this.io.to(`sensor_${sensor.id}`).emit('sensorData', {
+                    sensorId: sensor.id,
+                    value: value,
+                    timestamp: new Date().toISOString(),
+                    quality: 'good'
+                });
+                console.log(`📡 [BowlTemperatureHandler] ✅ Emitted sensorData to sensor_${sensor.id}: ${value.toFixed(2)}°C`);
+            }
+        } catch (error) {
+            console.error(`❌ [BowlTemperatureHandler] Error emitting sensorData:`, error.message);
+        }
 
         console.log(`🍲 [BowlTemperatureHandler] Active users: ${this.activeUsers.size}`);
 

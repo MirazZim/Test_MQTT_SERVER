@@ -1,9 +1,7 @@
-// mqtt/sensors/CO2Handler.js
-// ✅ UPDATED FOR redesigned_iot_database schema
-const BaseSensorHandler = require('../base/BaseSensorHandler');
-const pool = require('../../config/db');
+const BaseSensorHandler2 = require('../base/BaseSensorHandler');
+const pool2 = require('../../config/db');
 
-class CO2Handler extends BaseSensorHandler {
+class CO2Handler extends BaseSensorHandler2 {
     constructor(io, sensorData, activeUsers, sensorDataMutex) {
         super(io, sensorData, activeUsers, sensorDataMutex);
         console.log(`🔵 [CO2Handler] Initialized`);
@@ -20,6 +18,27 @@ class CO2Handler extends BaseSensorHandler {
 
         console.log(`💨 CO2 Level: ${value.toFixed(2)} ppm`);
         this.updateCache('co2_level', value);
+
+        // ✅ FIX: Emit sensorData for chart updates
+        try {
+            const [sensors] = await pool2.execute(
+                'SELECT id, user_id FROM sensors WHERE mqtt_topic = ? AND is_active = 1',
+                [topic]
+            );
+
+            if (sensors.length > 0) {
+                const sensor = sensors[0];
+                this.io.to(`sensor_${sensor.id}`).emit('sensorData', {
+                    sensorId: sensor.id,
+                    value: value,
+                    timestamp: new Date().toISOString(),
+                    quality: 'good'
+                });
+                console.log(`📡 [CO2Handler] ✅ Emitted sensorData to sensor_${sensor.id}: ${value.toFixed(2)} ppm`);
+            }
+        } catch (error) {
+            console.error(`❌ [CO2Handler] Error emitting sensorData:`, error.message);
+        }
 
         console.log(`💨 [CO2Handler] Active users: ${this.activeUsers.size}`);
 
@@ -50,7 +69,7 @@ class CO2Handler extends BaseSensorHandler {
         try {
             console.log(`🔵 [CO2Handler] Saving - User: ${userId}, Room: ${roomCode}`);
 
-            const [rooms] = await pool.execute(
+            const [rooms] = await pool2.execute(
                 'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
                 [userId, roomCode]
             );
@@ -63,7 +82,7 @@ class CO2Handler extends BaseSensorHandler {
             const roomId = rooms[0].id;
             console.log(`✅ [CO2Handler] Found room_id: ${roomId}`);
 
-            const [sensors] = await pool.execute(
+            const [sensors] = await pool2.execute(
                 `SELECT s.id FROM sensors s
          INNER JOIN sensor_types st ON s.sensor_type_id = st.id
          WHERE s.user_id = ? 
@@ -82,12 +101,12 @@ class CO2Handler extends BaseSensorHandler {
             const sensorId = sensors[0].id;
             console.log(`✅ [CO2Handler] Found sensor_id: ${sensorId}`);
 
-            await pool.execute(
+            await pool2.execute(
                 'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
                 [sensorId, value]
             );
 
-            await pool.execute(
+            await pool2.execute(
                 'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
                 [sensorId]
             );

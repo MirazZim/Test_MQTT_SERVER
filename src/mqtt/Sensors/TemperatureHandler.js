@@ -1,5 +1,5 @@
 // mqtt/sensors/TemperatureHandler.js
-// ✅ UPDATED FOR redesigned_iot_database schema with dynamic topic matching
+// ✅ FIXED: Added sensorData emission for real-time chart updates
 const BaseSensorHandler = require('../base/BaseSensorHandler');
 const pool = require('../../config/db');
 
@@ -19,7 +19,7 @@ class TemperatureHandler extends BaseSensorHandler {
             return;
         }
 
-        // ESP2 specific conversion (adjust based on your sensor calibration)
+        // ESP2 specific conversion
         const adjustedValue = value * 10.6;
         console.log(`🌡️ [TemperatureHandler] Raw: ${value}, Adjusted: ${adjustedValue.toFixed(2)}`);
 
@@ -27,7 +27,7 @@ class TemperatureHandler extends BaseSensorHandler {
         this.updateCache('temperature', adjustedValue);
         console.log(`🌡️ [TemperatureHandler] Active users: ${this.activeUsers.size}`);
 
-        // ✅ FIX: Emit sensorData for chart updates FIRST (before user loop)
+        // ✅ FIX: Emit sensorData for chart updates FIRST
         try {
             const [sensors] = await pool.execute(
                 'SELECT id, user_id FROM sensors WHERE mqtt_topic = ? AND is_active = 1',
@@ -36,13 +36,16 @@ class TemperatureHandler extends BaseSensorHandler {
 
             if (sensors.length > 0) {
                 const sensor = sensors[0];
+                // ✅ CRITICAL: Emit to sensor-specific room for chart updates
                 this.io.to(`sensor_${sensor.id}`).emit('sensorData', {
                     sensorId: sensor.id,
-                    value: adjustedValue, // Use adjusted value, not raw payload
+                    value: adjustedValue,
                     timestamp: new Date().toISOString(),
                     quality: 'good'
                 });
-                console.log(`📡 [TemperatureHandler] Emitted to sensor_${sensor.id}: ${adjustedValue.toFixed(2)}`);
+                console.log(`📡 [TemperatureHandler] ✅ Emitted sensorData to sensor_${sensor.id}: ${adjustedValue.toFixed(2)}°C`);
+            } else {
+                console.warn(`⚠️ [TemperatureHandler] No sensor found for topic: ${topic}`);
             }
         } catch (error) {
             console.error(`❌ [TemperatureHandler] Error emitting sensorData:`, error.message);
@@ -53,7 +56,6 @@ class TemperatureHandler extends BaseSensorHandler {
             try {
                 console.log(`🔵 [TemperatureHandler] Processing user ${userId} with rooms:`, Array.from(rooms));
 
-                // Save to database for each room the user is monitoring
                 for (const roomCode of rooms) {
                     await this.saveToDB(userId, roomCode, topic, adjustedValue);
                 }
@@ -77,7 +79,6 @@ class TemperatureHandler extends BaseSensorHandler {
         try {
             console.log(`🔵 [TemperatureHandler] Saving to DB - User: ${userId}, Room: ${roomCode}, Topic: ${mqttTopic}`);
 
-            // Get room_id
             const [rooms] = await pool.execute(
                 'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
                 [userId, roomCode]
@@ -91,7 +92,6 @@ class TemperatureHandler extends BaseSensorHandler {
             const roomId = rooms[0].id;
             console.log(`✅ [TemperatureHandler] Found room_id: ${roomId}`);
 
-            // Get sensor_id by mqtt_topic (DYNAMIC TOPIC MATCHING)
             const [sensors] = await pool.execute(
                 `SELECT id FROM sensors 
                  WHERE user_id = ? 
@@ -109,13 +109,11 @@ class TemperatureHandler extends BaseSensorHandler {
             const sensorId = sensors[0].id;
             console.log(`✅ [TemperatureHandler] Found sensor_id: ${sensorId}`);
 
-            // Insert measurement
             await pool.execute(
                 'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
                 [sensorId, value]
             );
 
-            // Update last_reading_at in sensors table
             await pool.execute(
                 'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
                 [sensorId]
@@ -123,7 +121,6 @@ class TemperatureHandler extends BaseSensorHandler {
 
             console.log(`✅ [TemperatureHandler] Saved: ${value.toFixed(2)}°C (sensor_id: ${sensorId})`);
 
-            // Emit environment update for dashboard
             this.io.to(`user_${userId}`).emit('environmentUpdate', {
                 location: roomCode,
                 temperature: value,

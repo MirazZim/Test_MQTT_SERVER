@@ -10,6 +10,7 @@ router.get("/:sensorId", adminOrUser, async (req, res) => {
     console.log(`\n🔵 ========== GET /api/environment/${req.params.sensorId} ==========`);
     console.log(`   User ID: ${req.user.id}`);
     console.log(`   Period: ${req.query.period || '24h'}`);
+    console.log(`   Timestamp: ${new Date().toISOString()}`);
 
     try {
         const { sensorId } = req.params;
@@ -25,15 +26,15 @@ router.get("/:sensorId", adminOrUser, async (req, res) => {
         };
         const interval = periodMap[period] || "24 HOUR";
 
-        console.log(`   Interval: ${interval}`);
+        console.log(`   SQL Interval: ${interval}`);
 
         // Verify sensor ownership
         console.log(`   Checking sensor ownership...`);
         const [sensorCheck] = await pool.execute(
             `SELECT s.id, s.sensor_name, st.type_code, st.unit 
-       FROM sensors s
-       JOIN sensor_types st ON s.sensor_type_id = st.id
-       WHERE s.id = ? AND s.user_id = ? AND s.is_active = 1`,
+             FROM sensors s
+             JOIN sensor_types st ON s.sensor_type_id = st.id
+             WHERE s.id = ? AND s.user_id = ? AND s.is_active = 1`,
             [sensorId, userId]
         );
 
@@ -45,26 +46,36 @@ router.get("/:sensorId", adminOrUser, async (req, res) => {
             });
         }
 
-        console.log(`   ✅ Sensor verified: ${sensorCheck[0].sensor_name}`);
+        console.log(`   ✅ Sensor verified: ${sensorCheck[0].sensor_name} (${sensorCheck[0].type_code})`);
 
         // Fetch measurements
-        console.log(`   Fetching measurements...`);
+        console.log(`   Fetching measurements from NOW() - INTERVAL ${interval}...`);
+        const startTime = new Date();
+
         const [measurements] = await pool.execute(
             `SELECT 
-        measured_value as value,
-        measured_at as timestamp,
-        quality_indicator,
-        is_anomaly
-       FROM sensor_measurements
-       WHERE sensor_id = ? 
-       AND measured_at >= NOW() - INTERVAL ${interval}
-       ORDER BY measured_at ASC
-       LIMIT 10000`,
+                measured_value as value,
+                measured_at as timestamp,
+                quality_indicator,
+                is_anomaly
+             FROM sensor_measurements
+             WHERE sensor_id = ? 
+             AND measured_at >= NOW() - INTERVAL ${interval}
+             ORDER BY measured_at ASC
+             LIMIT 10000`,
             [sensorId]
         );
 
+        const queryTime = new Date() - startTime;
+        console.log(`   ⏱️  Query took ${queryTime}ms`);
         console.log(`   ✅ Found ${measurements.length} measurements`);
 
+        if (measurements.length > 0) {
+            console.log(`   📊 First: ${measurements[0].timestamp} = ${measurements[0].value}`);
+            console.log(`   📊 Last: ${measurements[measurements.length - 1].timestamp} = ${measurements[measurements.length - 1].value}`);
+        }
+
+        // Process chart data
         const chartData = measurements.map(m => ({
             timestamp: new Date(m.timestamp).toISOString(),
             value: parseFloat(m.value),
@@ -72,16 +83,36 @@ router.get("/:sensorId", adminOrUser, async (req, res) => {
             anomaly: m.is_anomaly
         }));
 
+        // Set cache-control headers to prevent 304
+        res.set({
+            'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'Surrogate-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff'
+        });
+
+        console.log(`   ✅ Sending ${chartData.length} data points`);
+        console.log(`   🏁 Request complete\n`);
+
         return res.status(200).json({
             status: "success",
-            sensor: sensorCheck[0],
+            sensor: {
+                id: sensorCheck[0].id,
+                name: sensorCheck[0].sensor_name,
+                type: sensorCheck[0].type_code,
+                unit: sensorCheck[0].unit
+            },
             period,
+            interval,
             dataPoints: chartData.length,
-            data: chartData
+            data: chartData,
+            timestamp: new Date().toISOString()
         });
 
     } catch (error) {
         console.error(`   ❌ Error:`, error.message);
+        console.error(`   Stack:`, error.stack);
         return res.status(500).json({
             status: "error",
             message: "Failed to retrieve sensor data",
@@ -89,6 +120,7 @@ router.get("/:sensorId", adminOrUser, async (req, res) => {
         });
     }
 });
+
 
 console.log("✅ [Environment Routes] Loaded successfully");
 module.exports = router;
