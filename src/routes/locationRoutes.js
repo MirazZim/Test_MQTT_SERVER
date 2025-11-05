@@ -565,19 +565,29 @@ locationRouter.post("/locations/create-room", adminOrUser, async (req, res) => {
 });
 
 
-// DELETE /api/locations/:roomId - Delete room and all its devices
-locationRouter.delete("/locations/:roomId", adminOrUser, async (req, res) => {
-    console.log(`🔵 [Route DELETE /locations/:roomId] User: ${req.user.id}`);
+
+// PUT /api/locations/:roomId/update - Update room and MQTT topics
+locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) => {
+    console.log(`🔵 [Route PUT /locations/:roomId/update] User: ${req.user.id}`);
 
     try {
         const userId = req.user.id;
         const roomId = req.params.roomId;
+        const { roomName, sensorTopics, actuatorTopics } = req.body;
 
-        console.log(`🔵 [Route] Deleting room: ${roomId}`);
+        // Validate input
+        if (!roomName) {
+            return res.status(400).json({
+                status: "failed",
+                message: "roomName is required"
+            });
+        }
+
+        console.log(`🔵 [Route] Updating room ID: ${roomId}`);
 
         // Check if room belongs to user
         const [rooms] = await pool.execute(
-            'SELECT room_name FROM rooms WHERE user_id = ? AND id = ?',
+            'SELECT room_name FROM rooms WHERE user_id = ? AND id = ? AND is_active = 1',
             [userId, roomId]
         );
 
@@ -588,36 +598,271 @@ locationRouter.delete("/locations/:roomId", adminOrUser, async (req, res) => {
             });
         }
 
-        const roomName = rooms[0].room_name;
-
-        // Soft delete room and cascade to sensors/actuators
+        // Update room name
         await pool.execute(
-            'UPDATE rooms SET is_active = 0 WHERE id = ? AND user_id = ?',
+            'UPDATE rooms SET room_name = ?, room_code = ?, description = ? WHERE id = ? AND user_id = ?',
+            [roomName, roomName, `Room ${roomName}`, roomId, userId]
+        );
+
+        console.log(`✅ [Route] Updated room name to: ${roomName}`);
+
+        // Get MQTT client for topic management
+        const mqttClient = require("../server");
+        const client = mqttClient?.mqttConnection?.mqttClient;
+
+        // Update sensor MQTT topics if provided
+        if (sensorTopics && Object.keys(sensorTopics).length > 0) {
+            for (const [sensorType, newMqttTopic] of Object.entries(sensorTopics)) {
+                // Get existing sensor
+                const [existingSensors] = await pool.execute(
+                    `SELECT s.id, s.mqtt_topic, st.type_code 
+                     FROM sensors s
+                     JOIN sensor_types st ON s.sensor_type_id = st.id
+                     WHERE s.room_id = ? AND s.user_id = ? AND st.type_code = ? AND s.is_active = 1`,
+                    [roomId, userId, sensorType]
+                );
+
+                if (existingSensors.length > 0) {
+                    const oldTopic = existingSensors[0].mqtt_topic;
+                    const sensorId = existingSensors[0].id;
+
+                    // Update MQTT topic in database
+                    await pool.execute(
+                        'UPDATE sensors SET mqtt_topic = ? WHERE id = ?',
+                        [newMqttTopic, sensorId]
+                    );
+
+                    // MQTT: Unsubscribe from old topic and subscribe to new one
+                    if (client && oldTopic !== newMqttTopic) {
+                        // Unsubscribe from old topic
+                        client.unsubscribe(oldTopic, (err) => {
+                            if (!err) {
+                                console.log(`🔌 MQTT: Unsubscribed from old sensor topic: ${oldTopic}`);
+                            } else {
+                                console.error(`❌ MQTT: Failed to unsubscribe from ${oldTopic}:`, err);
+                            }
+                        });
+
+                        // Subscribe to new topic
+                        client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
+                            if (!err) {
+                                console.log(`🔌 MQTT: Subscribed to new sensor topic: ${newMqttTopic}`);
+                            } else {
+                                console.error(`❌ MQTT: Failed to subscribe to ${newMqttTopic}:`, err);
+                            }
+                        });
+                    }
+
+                    console.log(`✅ [Route] Updated sensor ${sensorType}: ${oldTopic} → ${newMqttTopic}`);
+                }
+            }
+        }
+
+        // Update actuator MQTT topics if provided
+        if (actuatorTopics && Object.keys(actuatorTopics).length > 0) {
+            for (const [actuatorType, newMqttTopic] of Object.entries(actuatorTopics)) {
+                // Get existing actuator
+                const [existingActuators] = await pool.execute(
+                    `SELECT a.id, a.mqtt_topic, at.type_code 
+                     FROM actuators a
+                     JOIN actuator_types at ON a.actuator_type_id = at.id
+                     WHERE a.room_id = ? AND a.user_id = ? AND at.type_code = ? AND a.is_active = 1`,
+                    [roomId, userId, actuatorType]
+                );
+
+                if (existingActuators.length > 0) {
+                    const oldTopic = existingActuators[0].mqtt_topic;
+                    const actuatorId = existingActuators[0].id;
+
+                    // Update MQTT topic in database
+                    await pool.execute(
+                        'UPDATE actuators SET mqtt_topic = ? WHERE id = ?',
+                        [newMqttTopic, actuatorId]
+                    );
+
+                    // MQTT: Unsubscribe from old topic and subscribe to new one
+                    if (client && oldTopic !== newMqttTopic) {
+                        // Unsubscribe from old topic
+                        client.unsubscribe(oldTopic, (err) => {
+                            if (!err) {
+                                console.log(`🔌 MQTT: Unsubscribed from old actuator topic: ${oldTopic}`);
+                            } else {
+                                console.error(`❌ MQTT: Failed to unsubscribe from ${oldTopic}:`, err);
+                            }
+                        });
+
+                        // Subscribe to new topic
+                        client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
+                            if (!err) {
+                                console.log(`🔌 MQTT: Subscribed to new actuator topic: ${newMqttTopic}`);
+                            } else {
+                                console.error(`❌ MQTT: Failed to subscribe to ${newMqttTopic}:`, err);
+                            }
+                        });
+                    }
+
+                    console.log(`✅ [Route] Updated actuator ${actuatorType}: ${oldTopic} → ${newMqttTopic}`);
+                }
+            }
+        }
+
+        // Get updated devices
+        const [sensors] = await pool.execute(
+            `SELECT s.id, s.sensor_code, s.sensor_name, s.mqtt_topic, st.type_code, st.type_name, st.unit
+             FROM sensors s
+             JOIN sensor_types st ON s.sensor_type_id = st.id
+             WHERE s.room_id = ? AND s.user_id = ? AND s.is_active = 1`,
             [roomId, userId]
         );
 
-        await pool.execute(
-            'UPDATE sensors SET is_active = 0 WHERE room_id = ? AND user_id = ?',
+        const [actuators] = await pool.execute(
+            `SELECT a.id, a.actuator_code, a.actuator_name, a.mqtt_topic, at.type_code, at.type_name
+             FROM actuators a
+             JOIN actuator_types at ON a.actuator_type_id = at.id
+             WHERE a.room_id = ? AND a.user_id = ? AND a.is_active = 1`,
             [roomId, userId]
         );
-
-        await pool.execute(
-            'UPDATE actuators SET is_active = 0 WHERE room_id = ? AND user_id = ?',
-            [roomId, userId]
-        );
-
-        console.log(`✅ [Route] Deleted room ${roomId} and all its devices`);
 
         res.json({
             status: "success",
-            message: `Room "${roomName}" deleted successfully`
+            message: `Room "${roomName}" updated successfully`,
+            roomId: roomId,
+            roomName: roomName,
+            sensors: sensors,
+            actuators: actuators
+        });
+
+        console.log(`✅ [Route PUT /locations/:roomId/update] Success`);
+
+    } catch (error) {
+        console.error(`❌ [Route PUT /locations/:roomId/update] Error:`, error.message);
+        res.status(500).json({
+            status: "failed",
+            message: "Internal server error",
+            error: error.message
+        });
+    }
+});
+
+
+// ==================== DELETE ROUTE (FIXED) ====================
+
+// DELETE /api/locations/:roomId - Delete room and unsubscribe from MQTT topics
+// DELETE /api/locations/:roomId - Delete room and unsubscribe from MQTT topics
+// DELETE /api/locations/:roomId - Hard delete room and all related data
+locationRouter.delete("/locations/:roomId", adminOrUser, async (req, res) => {
+    console.log(`🔵 [Route DELETE /locations/:roomId] User: ${req.user.id}`);
+    console.log(`🔵 [Route DELETE] Request params:`, req.params);
+    console.log(`🔵 [Route DELETE] Room ID to delete:`, req.params.roomId);
+
+    try {
+        const userId = req.user.id;
+        const roomId = req.params.roomId;
+
+        console.log(`🔵 [Route] Attempting to delete room: ${roomId} for user: ${userId}`);
+
+        // Check if room belongs to user and is active
+        const [rooms] = await pool.execute(
+            'SELECT id, room_name FROM rooms WHERE user_id = ? AND id = ? AND is_active = 1',
+            [userId, roomId]
+        );
+
+        console.log(`🔵 [Route] Found rooms:`, rooms);
+
+        if (rooms.length === 0) {
+            console.warn(`⚠️ [Route] Room ${roomId} not found or already deleted`);
+            return res.status(404).json({
+                status: "failed",
+                message: "Room not found or access denied"
+            });
+        }
+
+        const roomName = rooms[0].room_name;
+        console.log(`🔵 [Route] Deleting room: ${roomName}`);
+
+        // Get all MQTT topics for this room before deleting
+        const [sensors] = await pool.execute(
+            'SELECT id, mqtt_topic FROM sensors WHERE room_id = ? AND user_id = ? AND is_active = 1',
+            [roomId, userId]
+        );
+
+        const [actuators] = await pool.execute(
+            'SELECT id, mqtt_topic FROM actuators WHERE room_id = ? AND user_id = ? AND is_active = 1',
+            [roomId, userId]
+        );
+
+        console.log(`🔵 [Route] Found ${sensors.length} sensors and ${actuators.length} actuators to delete`);
+
+        // MQTT: Unsubscribe from all topics before deletion
+        const mqttClient = require("../server");
+        const client = mqttClient?.mqttConnection?.mqttClient;
+
+        if (client) {
+            // Unsubscribe from sensor topics
+            sensors.forEach(sensor => {
+                if (sensor.mqtt_topic) {
+                    client.unsubscribe(sensor.mqtt_topic, (err) => {
+                        if (!err) {
+                            console.log(`🔌 MQTT: Unsubscribed from sensor topic: ${sensor.mqtt_topic}`);
+                        } else {
+                            console.error(`❌ MQTT: Failed to unsubscribe from ${sensor.mqtt_topic}:`, err);
+                        }
+                    });
+                }
+            });
+
+            // Unsubscribe from actuator topics
+            actuators.forEach(actuator => {
+                if (actuator.mqtt_topic) {
+                    client.unsubscribe(actuator.mqtt_topic, (err) => {
+                        if (!err) {
+                            console.log(`🔌 MQTT: Unsubscribed from actuator topic: ${actuator.mqtt_topic}`);
+                        } else {
+                            console.error(`❌ MQTT: Failed to unsubscribe from ${actuator.mqtt_topic}:`, err);
+                        }
+                    });
+                }
+            });
+        } else {
+            console.warn(`⚠️ [Route] MQTT client not available for unsubscription`);
+        }
+
+        // ✅ HARD DELETE: Delete room (CASCADE will automatically delete sensors, actuators, measurements, etc.)
+        const [deleteResult] = await pool.execute(
+            'DELETE FROM rooms WHERE id = ? AND user_id = ?',
+            [roomId, userId]
+        );
+
+        console.log(`✅ [Route] Hard delete result:`, deleteResult);
+
+        if (deleteResult.affectedRows === 0) {
+            return res.status(404).json({
+                status: "failed",
+                message: "Room could not be deleted"
+            });
+        }
+
+        console.log(`✅ [Route] Successfully HARD DELETED room ${roomId} and all related data via CASCADE`);
+        console.log(`📊 [Route] Cascade deleted: ${sensors.length} sensors, ${actuators.length} actuators, and all measurements`);
+
+        res.json({
+            status: "success",
+            message: `Room "${roomName}" permanently deleted`,
+            roomId: parseInt(roomId),
+            deletedData: {
+                sensors: sensors.length,
+                actuators: actuators.length,
+                cascadeDeleted: true
+            }
         });
 
     } catch (error) {
-        console.error("❌ [Route DELETE /locations/:roomId] Error:", error.message);
+        console.error("❌ [Route DELETE /locations/:roomId] Error:", error);
+        console.error("❌ [Route DELETE] Error stack:", error.stack);
         res.status(500).json({
             status: "failed",
-            message: "Internal server error"
+            message: "Internal server error",
+            error: error.message
         });
     }
 });
