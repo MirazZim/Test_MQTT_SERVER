@@ -257,7 +257,7 @@ spatialRouter.get("/performance/:location", adminOrUser, async (req, res) => {
         });
     } catch (error) {
         console.error("❌ [Route GET /performance/:location] Error:", error.message);
-        res.status(500).json({
+        res.status(400).json({
             status: "failed",
             error: "Failed to fetch performance metrics"
         });
