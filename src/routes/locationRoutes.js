@@ -282,6 +282,59 @@ locationRouter.get("/locations/:location/stats", adminOrUser, async (req, res) =
     }
 });
 
+// GET /api/locations/:location/actuators - Get actuators for a room
+locationRouter.get("/locations/:location/actuators", adminOrUser, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const location = decodeURIComponent(req.params.location);
+
+        const [rooms] = await pool.execute(
+            'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
+            [userId, location]
+        );
+
+        if (rooms.length === 0) {
+            return res.status(404).json({
+                status: "failed",
+                message: "Room not found"
+            });
+        }
+
+        const roomId = rooms[0].id;
+
+        const [actuators] = await pool.execute(
+            `SELECT 
+                a.id,
+                a.actuator_code,
+                a.actuator_name,
+                a.mqtt_topic,
+                at.type_code,
+                at.type_name,
+                a.current_state,
+                a.updated_at
+             FROM actuators a
+             INNER JOIN actuator_types at ON a.actuator_type_id = at.id
+             WHERE a.room_id = ? AND a.user_id = ? AND a.is_active = 1
+             ORDER BY at.type_name`,
+            [roomId, userId]
+        );
+
+        res.json({
+            status: "success",
+            roomId: roomId,
+            location: location,
+            actuators: actuators
+        });
+
+    } catch (error) {
+        console.error("Error:", error.message);
+        res.status(500).json({
+            status: "failed",
+            message: "Internal server error"
+        });
+    }
+});
+
 // Get control state for specific location (actuators)
 locationRouter.get("/locations/:location/control", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route /locations/:location/control] GET - User: ${req.user.id}`);

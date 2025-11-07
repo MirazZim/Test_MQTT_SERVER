@@ -110,12 +110,42 @@ class EnhancedMqttHandler {
 
     // ✅ KEEP: Legacy topic support for existing devices
     async subscribeLegacyTopics(client) {
-        const legacyTopics = [
-            'ESP', 'ESP2', 'bowl', 'bowlT', 'sonar', 'sonarT',
-            'CO2', 'CO2T', 'sugar', 'sugarT', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
+        const legacySensorTopics = [
+            'ESP', 'ESP2', 'bowl', 'sonar',
+            'CO2', 'sugar', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
         ];
 
-        for (const topic of legacyTopics) {
+        const legacyActuatorTopics = [
+            'bowlT',    // bowl_fan_status
+            'sonarT',   // sonar_pump_status
+            'CO2T',     // co2_fermentation_status
+            'sugarT'    // sugar_fermentation_status
+        ];
+
+        for (const topic of legacySensorTopics) {
+            if (!this.subscribedTopics.has(topic)) {
+                try {
+                    await new Promise((resolve, reject) => {
+                        const timeout = setTimeout(() => reject(new Error('Subscribe timeout')), 5000);
+
+                        client.subscribe(topic, { qos: 1 }, (err) => {
+                            clearTimeout(timeout);
+                            if (!err) {
+                                this.subscribedTopics.add(topic);
+                                console.log(`📡 [EnhancedMqttHandler] Subscribed to legacy topic: ${topic}`);
+                                resolve();
+                            } else {
+                                reject(err);
+                            }
+                        });
+                    });
+                } catch (error) {
+                    console.error(`❌ Failed to subscribe to legacy topic ${topic}:`, error.message);
+                }
+            }
+        }
+
+        for (const topic of legacyActuatorTopics) {
             if (!this.subscribedTopics.has(topic)) {
                 try {
                     await new Promise((resolve, reject) => {
@@ -390,19 +420,15 @@ class EnhancedMqttHandler {
 
     async handleDynamicMessage(topic, payload) {
         try {
-            if (!topic || topic.length > 100 || /[^\w\/\-_]/.test(topic)) {
-                console.warn(`⚠️ Invalid topic format: ${topic}`);
-                return;
-            }
-
+            // Check sensors first
             const [sensors] = await pool.execute(
                 `SELECT s.*, st.type_code, st.type_name, st.unit, 
-            r.room_code, r.room_name, r.id as room_id
-     FROM sensors s
-     INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-     LEFT JOIN rooms r ON s.room_id = r.id
-     WHERE s.mqtt_topic = ? AND s.is_active = 1
-     LIMIT 1`,
+                    r.room_code, r.room_name, r.id as room_id
+             FROM sensors s
+             INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+             LEFT JOIN rooms r ON s.room_id = r.id
+             WHERE s.mqtt_topic = ? AND s.is_active = 1
+             LIMIT 1`,
                 [topic]
             );
 
@@ -411,13 +437,15 @@ class EnhancedMqttHandler {
                 return;
             }
 
+            // Check actuators (NEW LOGIC)
             const [actuators] = await pool.execute(
-                `SELECT a.*, at.type_code, at.type_name, r.room_code, r.room_name, r.id as room_id
-                 FROM actuators a
-                 INNER JOIN actuator_types at ON a.actuator_type_id = at.id
-                 LEFT JOIN rooms r ON a.room_id = r.id
-                 WHERE a.mqtt_topic = ? AND a.is_active = 1
-                 LIMIT 1`,
+                `SELECT a.*, at.type_code, at.type_name, 
+                    r.room_code, r.room_name, r.id as room_id
+             FROM actuators a
+             INNER JOIN actuator_types at ON a.actuator_type_id = at.id
+             LEFT JOIN rooms r ON a.room_id = r.id
+             WHERE a.mqtt_topic = ? AND a.is_active = 1
+             LIMIT 1`,
                 [topic]
             );
 
@@ -426,9 +454,9 @@ class EnhancedMqttHandler {
                 return;
             }
 
-            console.warn(`⚠️ No active sensor/actuator found for topic: ${topic}`);
+            console.warn(`⚠️ No sensor or actuator found for topic: ${topic}`);
         } catch (error) {
-            console.error(`❌ Error handling dynamic message:`, error.message);
+            console.error(`❌ Error handling message:`, error.message);
         }
     }
 
@@ -519,31 +547,50 @@ class EnhancedMqttHandler {
         try {
             console.log(`🎛️ Processing actuator: ${actuator.actuator_name} (${actuator.type_code})`);
 
-            if (!actuator.id || !actuator.user_id) {
-                console.error('❌ Invalid actuator data');
-                return;
-            }
-
             const state = payload.toUpperCase();
             const numericState = state === 'ON' ? 1 : 0;
 
+            // Update actuators table
             await pool.execute(
-                `INSERT INTO actuator_control_logs (actuator_id, command_issued, executed_at, execution_status)
-                 VALUES (?, ?, NOW(3), 'success')`,
-                [actuator.id, state]
+                'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
+                [state, actuator.id]
+            );
+
+            // Log to actuator_control_logs
+            await pool.execute(
+                `INSERT INTO actuator_control_logs 
+             (actuator_id, command_value, command_source, executed_at)
+             VALUES (?, ?, 'mqtt', NOW())`,
+                [actuator.id, numericState]
+            );
+
+            // Update actuator_states
+            await pool.execute(
+                `INSERT INTO actuator_states 
+             (user_id, room_id, actuator_type, status, message, state, timestamp)
+             VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                [
+                    actuator.user_id,
+                    actuator.room_id,
+                    actuator.type_code,
+                    state,
+                    this.getActuatorMessage(actuator.type_code, state),
+                    numericState
+                ]
             );
 
             console.log(`✅ Logged actuator: ${state} for ${actuator.actuator_name}`);
 
-            const timestamp = new Date().toISOString();
+            // Emit to frontend
             const roomCode = actuator.room_code || 'unknown';
+            const timestamp = new Date().toISOString();
 
             this.io.to(`user_${actuator.user_id}_${roomCode}`).emit('actuatorUpdate', {
                 actuatorId: actuator.id,
                 actuatorType: actuator.type_code,
                 actuatorName: actuator.actuator_name,
                 roomCode: roomCode,
-                roomName: actuator.room_name || 'Unknown Room',
+                roomName: actuator.room_name,
                 state: state,
                 numericState: numericState,
                 timestamp: timestamp,
@@ -553,6 +600,29 @@ class EnhancedMqttHandler {
         } catch (error) {
             console.error(`❌ Error handling actuator:`, error.message);
         }
+    }
+
+    getActuatorMessage(typeCode, state) {
+        const messages = {
+            'bowl_fan_status': {
+                'ON': '🌡️ Temp High, Fan is ON',
+                'OFF': '✅ Temp normal, Fan off'
+            },
+            'sonar_pump_status': {
+                'ON': '💧 Water level low, Pump is ON',
+                'OFF': '✅ Water level normal, Pump is Off'
+            },
+            'co2_fermentation_status': {
+                'ACTIVE': '🫧 Fermentation going',
+                'OFF': '⚠️ Fermentation is Off'
+            },
+            'sugar_fermentation_status': {
+                'COMPLETE': '✅ Fermentation complete',
+                'CLOSED': '❌ Fermentation closed'
+            }
+        };
+
+        return messages[typeCode]?.[state] || `Status: ${state}`;
     }
 
     onError(error) {
