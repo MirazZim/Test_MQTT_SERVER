@@ -867,6 +867,89 @@ locationRouter.delete("/locations/:roomId", adminOrUser, async (req, res) => {
     }
 });
 
+// GET /api/locations/:location/sensors - Get active sensors for a room
+locationRouter.get("/locations/:location/sensors", adminOrUser, async (req, res) => {
+    console.log(`🔵 [Route GET /locations/:location/sensors] User: ${req.user.id}`);
+
+    try {
+        const userId = req.user.id;
+        const location = decodeURIComponent(req.params.location);
+
+        console.log(`🔵 [Route] Looking for room: "${location}"`);
+
+        // ✅ SIMPLIFIED: Try exact match first, then flexible match
+        const [rooms] = await pool.execute(
+            `SELECT id, room_name, room_code 
+             FROM rooms 
+             WHERE user_id = ? 
+             AND is_active = 1
+             AND (room_code = ? OR room_name = ?)
+             LIMIT 1`,
+            [userId, location, location]
+        );
+
+        console.log(`🔵 [Route] Found rooms:`, rooms);
+
+        if (rooms.length === 0) {
+            console.warn(`⚠️ [Route] No room found for location: ${location}`);
+
+            // Try to find ANY active room for debugging
+            const [debugRooms] = await pool.execute(
+                'SELECT id, room_name, room_code FROM rooms WHERE user_id = ? AND is_active = 1',
+                [userId]
+            );
+            console.log(`🔵 [Route] All available rooms for user:`, debugRooms);
+
+            return res.status(404).json({
+                status: "failed",
+                message: `Room not found for location: ${location}`,
+                searchedFor: location,
+                availableRooms: debugRooms.map(r => ({ name: r.room_name, code: r.room_code }))
+            });
+        }
+
+        const roomId = rooms[0].id;
+        console.log(`✅ [Route] Found room_id: ${roomId} (${rooms[0].room_name})`);
+
+        // Get all active sensors for this room
+        const [sensors] = await pool.execute(
+            `SELECT 
+                s.id,
+                s.sensor_code,
+                s.sensor_name,
+                s.mqtt_topic,
+                st.type_code,
+                st.type_name,
+                st.unit,
+                s.last_reading_at
+             FROM sensors s
+             INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+             WHERE s.room_id = ? AND s.user_id = ? AND s.is_active = 1
+             ORDER BY st.type_name`,
+            [roomId, userId]
+        );
+
+        console.log(`✅ [Route] Found ${sensors.length} active sensors for ${location}`);
+        console.log(`📊 [Route] Sensors:`, sensors.map(s => ({ name: s.sensor_name, type: s.type_code })));
+
+        res.json({
+            status: "success",
+            roomId: roomId,
+            roomName: rooms[0].room_name,
+            roomCode: rooms[0].room_code,
+            sensors: sensors
+        });
+
+    } catch (error) {
+        console.error("❌ [Route GET /locations/:location/sensors] Error:", error.message);
+        res.status(500).json({
+            status: "failed",
+            message: "Internal server error",
+            error: error.message
+        });
+    }
+});
+
 // GET /api/locations/:roomId/devices - Get all sensors and actuators for a room
 locationRouter.get("/locations/:roomId/devices", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route GET /locations/:roomId/devices] User: ${req.user.id}`);
