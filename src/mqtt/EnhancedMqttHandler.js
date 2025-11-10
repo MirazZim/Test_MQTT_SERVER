@@ -1,6 +1,13 @@
+// src/mqtt/EnhancedMqttHandler.js - FIXED VERSION
 const { Mutex } = require("async-mutex");
 const MqttConnection = require('./connection/MqttConnection');
 const pool = require('../config/db');
+
+// Import actuator handlers
+const BowlFanHandler = require('./Actuators/BowlFanHandler');
+const SonarPumpHandler = require('./Actuators/SonarPumpHandler');
+const CO2FermentationHandler = require('./Actuators/CO2FermentationHandler');
+const SugarFermentationHandler = require('./Actuators/SugarFermentationHandler');
 
 class EnhancedMqttHandler {
     constructor(io) {
@@ -10,8 +17,9 @@ class EnhancedMqttHandler {
         this.mqttClient = null;
         this.activeUsers = new Map();
         this.subscribedTopics = new Set();
+
+        // Sensor data cache
         this.sensorData = {
-            // ✅ KEEP: Original sensor data cache for backward compatibility
             temperature: null,
             humidity: null,
             bowl_temp: null,
@@ -24,11 +32,50 @@ class EnhancedMqttHandler {
             sugar_fermentation_status: null,
             esp3_data: null
         };
+
         this.sensorDataMutex = new Mutex();
         this.locationMutexes = new Map();
         this.cleanupInterval = null;
 
+        // ✅ CRITICAL FIX: Initialize actuator handlers
+        this.initializeActuatorHandlers();
+
         console.log(`✅ [EnhancedMqttHandler] Initialized with dynamic handler`);
+    }
+
+    // ✅ NEW: Initialize actuator handlers
+    initializeActuatorHandlers() {
+        console.log(`🔵 [EnhancedMqttHandler] Initializing actuator handlers...`);
+
+        this.bowlFanHandler = new BowlFanHandler(
+            this.io,
+            this.sensorData,
+            this.activeUsers,
+            this.sensorDataMutex
+        );
+
+        this.sonarPumpHandler = new SonarPumpHandler(
+            this.io,
+            this.sensorData,
+            this.activeUsers,
+            this.sensorDataMutex
+        );
+
+        this.co2FermentationHandler = new CO2FermentationHandler(
+            this.io,
+            this.sensorData,
+            this.activeUsers,
+            this.sensorDataMutex
+        );
+
+        this.sugarFermentationHandler = new SugarFermentationHandler(
+            this.io,
+            this.sensorData,
+            this.activeUsers,
+            this.sensorDataMutex
+        );
+
+        console.log(`✅ [EnhancedMqttHandler] Actuator handlers initialized`);
     }
 
     setupSocketHandlers() {
@@ -88,33 +135,25 @@ class EnhancedMqttHandler {
         this.mqttClient = client;
 
         try {
-            // ✅ KEEP: Subscribe to legacy topics for backward compatibility
+            // Subscribe to legacy topics
             await this.subscribeLegacyTopics(client);
 
-            // ✅ NEW: Subscribe to dynamic database topics
+            // Subscribe to dynamic database topics
             await this.subscribeToAllActiveSensors(client);
             await this.subscribeToAllActiveActuators(client);
-
-            // Periodic cleanup
-            if (this.cleanupInterval) clearInterval(this.cleanupInterval);
-            this.cleanupInterval = setInterval(() => {
-                this.cleanupInactiveSubscriptions().catch(err =>
-                    console.error('❌ Cleanup error:', err)
-                );
-            }, 5 * 60 * 1000);
 
         } catch (error) {
             console.error('❌ [EnhancedMqttHandler] Error during initial subscription:', error);
         }
     }
 
-    // ✅ KEEP: Legacy topic support for existing devices
     async subscribeLegacyTopics(client) {
         const legacySensorTopics = [
             'ESP', 'ESP2', 'bowl', 'sonar',
             'CO2', 'sugar', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
         ];
 
+        // ✅ CRITICAL FIX: Actuator topics
         const legacyActuatorTopics = [
             'bowlT',    // bowl_fan_status
             'sonarT',   // sonar_pump_status
@@ -132,7 +171,7 @@ class EnhancedMqttHandler {
                             clearTimeout(timeout);
                             if (!err) {
                                 this.subscribedTopics.add(topic);
-                                console.log(`📡 [EnhancedMqttHandler] Subscribed to legacy topic: ${topic}`);
+                                console.log(`📡 [EnhancedMqttHandler] Subscribed to legacy sensor: ${topic}`);
                                 resolve();
                             } else {
                                 reject(err);
@@ -145,6 +184,7 @@ class EnhancedMqttHandler {
             }
         }
 
+        // ✅ CRITICAL FIX: Subscribe to actuator topics
         for (const topic of legacyActuatorTopics) {
             if (!this.subscribedTopics.has(topic)) {
                 try {
@@ -155,7 +195,7 @@ class EnhancedMqttHandler {
                             clearTimeout(timeout);
                             if (!err) {
                                 this.subscribedTopics.add(topic);
-                                console.log(`📡 [EnhancedMqttHandler] Subscribed to legacy topic: ${topic}`);
+                                console.log(`📡 [EnhancedMqttHandler] Subscribed to legacy actuator: ${topic}`);
                                 resolve();
                             } else {
                                 reject(err);
@@ -163,7 +203,7 @@ class EnhancedMqttHandler {
                         });
                     });
                 } catch (error) {
-                    console.error(`❌ Failed to subscribe to legacy topic ${topic}:`, error.message);
+                    console.error(`❌ Failed to subscribe to legacy actuator ${topic}:`, error.message);
                 }
             }
         }
@@ -245,102 +285,6 @@ class EnhancedMqttHandler {
         }
     }
 
-    async cleanupInactiveSubscriptions() {
-        try {
-            const [activeTopics] = await pool.execute(
-                `SELECT DISTINCT mqtt_topic FROM sensors WHERE is_active = 1 AND mqtt_topic IS NOT NULL
-                 UNION
-                 SELECT DISTINCT mqtt_topic FROM actuators WHERE is_active = 1 AND mqtt_topic IS NOT NULL`
-            );
-
-            const legacyTopics = new Set([
-                'ESP', 'ESP2', 'bowl', 'bowlT', 'sonar', 'sonarT',
-                'CO2', 'CO2T', 'sugar', 'sugarT', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
-            ]);
-
-            const activeSet = new Set(activeTopics.map(t => t.mqtt_topic));
-
-            for (const topic of this.subscribedTopics) {
-                // Don't cleanup legacy topics
-                if (!legacyTopics.has(topic) && !activeSet.has(topic)) {
-                    console.log(`🧹 Cleaning up inactive topic: ${topic}`);
-                    await this.unsubscribeFromTopic(topic);
-                }
-            }
-        } catch (error) {
-            console.error('❌ Error cleaning up subscriptions:', error.message);
-        }
-    }
-
-    async subscribeToDynamicTopic(topic) {
-        if (!this.mqttClient || !this.mqttClient.connected) {
-            console.error('❌ MQTT client not connected');
-            return false;
-        }
-
-        if (!topic || topic.trim() === '') {
-            console.error('❌ Invalid topic');
-            return false;
-        }
-
-        if (this.subscribedTopics.has(topic)) {
-            console.log(`⚠️ Already subscribed to topic: ${topic}`);
-            return true;
-        }
-
-        try {
-            await new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => reject(new Error('Subscribe timeout')), 5000);
-
-                this.mqttClient.subscribe(topic, { qos: 1 }, (err) => {
-                    clearTimeout(timeout);
-                    if (!err) {
-                        this.subscribedTopics.add(topic);
-                        console.log(`✅ Dynamically subscribed to: ${topic}`);
-                        resolve(true);
-                    } else {
-                        reject(err);
-                    }
-                });
-            });
-            return true;
-        } catch (error) {
-            console.error(`❌ Failed to subscribe to ${topic}:`, error.message);
-            return false;
-        }
-    }
-
-    async unsubscribeFromTopic(topic) {
-        if (!this.mqttClient || !this.mqttClient.connected) {
-            return false;
-        }
-
-        if (!this.subscribedTopics.has(topic)) {
-            return true;
-        }
-
-        try {
-            await new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => reject(new Error('Unsubscribe timeout')), 5000);
-
-                this.mqttClient.unsubscribe(topic, (err) => {
-                    clearTimeout(timeout);
-                    if (!err) {
-                        this.subscribedTopics.delete(topic);
-                        console.log(`✅ Unsubscribed from: ${topic}`);
-                        resolve(true);
-                    } else {
-                        reject(err);
-                    }
-                });
-            });
-            return true;
-        } catch (error) {
-            console.error(`❌ Failed to unsubscribe from ${topic}:`, error.message);
-            return false;
-        }
-    }
-
     async onMessage(topic, message) {
         if (message.length > 10000) {
             console.warn(`⚠️ Payload too large for ${topic}: ${message.length} bytes`);
@@ -351,43 +295,76 @@ class EnhancedMqttHandler {
         console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${payload}`);
 
         try {
-            // ✅ KEEP: Check legacy topics first for backward compatibility
+            // ✅ CRITICAL FIX: Check if it's an actuator topic FIRST
+            if (this.isActuatorTopic(topic)) {
+                await this.handleActuatorTopic(topic, payload);
+                return;
+            }
+
+            // Then check legacy sensor topics
             if (this.isLegacyTopic(topic)) {
                 await this.handleLegacyTopic(topic, payload);
-            } else {
-                // ✅ NEW: Handle dynamic database topics
-                await this.handleDynamicMessage(topic, payload);
+                return;
             }
+
+            // Finally check dynamic database topics
+            await this.handleDynamicMessage(topic, payload);
+
         } catch (error) {
             console.error(`❌ Error processing ${topic}:`, error.message);
         }
     }
 
-    // ✅ KEEP: Legacy topic checker
+    // ✅ CRITICAL FIX: New method to identify actuator topics
+    isActuatorTopic(topic) {
+        const actuatorTopics = ['bowlT', 'sonarT', 'CO2T', 'sugarT'];
+        return actuatorTopics.includes(topic);
+    }
+
+    // ✅ CRITICAL FIX: New method to handle actuator topics
+    async handleActuatorTopic(topic, payload) {
+        console.log(`🎛️ [EnhancedMqttHandler] Handling actuator topic: ${topic}`);
+
+        try {
+            switch (topic) {
+                case 'bowlT':
+                    await this.bowlFanHandler.handleBowlFanData(topic, payload);
+                    break;
+                case 'sonarT':
+                    await this.sonarPumpHandler.handleSonarPumpData(topic, payload);
+                    break;
+                case 'CO2T':
+                    await this.co2FermentationHandler.handleCO2FermentationData(topic, payload);
+                    break;
+                case 'sugarT':
+                    await this.sugarFermentationHandler.handleSugarFermentationData(topic, payload);
+                    break;
+                default:
+                    console.warn(`⚠️ Unknown actuator topic: ${topic}`);
+            }
+        } catch (error) {
+            console.error(`❌ Error handling actuator topic ${topic}:`, error.message);
+        }
+    }
+
     isLegacyTopic(topic) {
         const legacyTopics = [
-            'ESP', 'ESP2', 'bowl', 'bowlT', 'sonar', 'sonarT',
-            'CO2', 'CO2T', 'sugar', 'sugarT', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
+            'ESP', 'ESP2', 'bowl', 'sonar',
+            'CO2', 'sugar', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
         ];
         return legacyTopics.includes(topic);
     }
 
-    // ✅ KEEP: Legacy topic handler (maps to dynamic system)
     async handleLegacyTopic(topic, payload) {
         console.log(`📜 [Legacy] Handling legacy topic: ${topic}`);
 
-        // Map legacy topics to sensor types
         const legacyMapping = {
             'ESP2': 'temperature',
             'ESP': 'humidity',
             'bowl': 'bowl_temp',
-            'bowlT': 'bowl_fan_status',
             'sonar': 'sonar_distance',
-            'sonarT': 'sonar_pump_status',
             'CO2': 'co2_level',
-            'CO2T': 'co2_fermentation_status',
             'sugar': 'sugar_level',
-            'sugarT': 'sugar_fermentation_status',
             'ESP3': 'airflow',
             'ESPX': 'temperature',
             'ESPX2': 'temperature',
@@ -400,7 +377,6 @@ class EnhancedMqttHandler {
             return;
         }
 
-        // Find sensor with this legacy topic or type
         const [sensors] = await pool.execute(
             `SELECT s.*, st.type_code, st.type_name, st.unit, r.room_code, r.room_name, r.id as room_id
              FROM sensors s
@@ -424,11 +400,11 @@ class EnhancedMqttHandler {
             const [sensors] = await pool.execute(
                 `SELECT s.*, st.type_code, st.type_name, st.unit, 
                     r.room_code, r.room_name, r.id as room_id
-             FROM sensors s
-             INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-             LEFT JOIN rooms r ON s.room_id = r.id
-             WHERE s.mqtt_topic = ? AND s.is_active = 1
-             LIMIT 1`,
+                 FROM sensors s
+                 INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+                 LEFT JOIN rooms r ON s.room_id = r.id
+                 WHERE s.mqtt_topic = ? AND s.is_active = 1
+                 LIMIT 1`,
                 [topic]
             );
 
@@ -437,15 +413,15 @@ class EnhancedMqttHandler {
                 return;
             }
 
-            // Check actuators (NEW LOGIC)
+            // Check actuators
             const [actuators] = await pool.execute(
                 `SELECT a.*, at.type_code, at.type_name, 
                     r.room_code, r.room_name, r.id as room_id
-             FROM actuators a
-             INNER JOIN actuator_types at ON a.actuator_type_id = at.id
-             LEFT JOIN rooms r ON a.room_id = r.id
-             WHERE a.mqtt_topic = ? AND a.is_active = 1
-             LIMIT 1`,
+                 FROM actuators a
+                 INNER JOIN actuator_types at ON a.actuator_type_id = at.id
+                 LEFT JOIN rooms r ON a.room_id = r.id
+                 WHERE a.mqtt_topic = ? AND a.is_active = 1
+                 LIMIT 1`,
                 [topic]
             );
 
@@ -483,14 +459,13 @@ class EnhancedMqttHandler {
                 }
             }
 
-            // Update sensorData cache
             if (this.sensorData.hasOwnProperty(sensor.type_code)) {
                 this.sensorData[sensor.type_code] = value;
             }
 
             await pool.execute(
                 `INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator)
-             VALUES (?, ?, NOW(3), 100)`,
+                 VALUES (?, ?, NOW(3), 100)`,
                 [sensor.id, value]
             );
 
@@ -502,25 +477,15 @@ class EnhancedMqttHandler {
             console.log(`✅ Saved: ${value} for ${sensor.sensor_name}`);
 
             const timestamp = new Date().toISOString();
-
-            // ✅ FIX: Get room identifier from database query
             const roomCode = sensor.room_code || sensor.room_name || 'unknown';
 
-            console.log(`📡 Emitting sensorUpdate to user_${sensor.user_id}_${roomCode}:`, {
-                sensorType: sensor.type_code,
-                value: value,
-                roomCode: roomCode,
-                roomName: sensor.room_name
-            });
-
-            // ✅ CRITICAL FIX: Add roomCode, roomName, and location fields
             this.io.to(`user_${sensor.user_id}_${roomCode}`).emit('sensorUpdate', {
                 sensorId: sensor.id,
                 sensorType: sensor.type_code,
                 sensorName: sensor.sensor_name,
-                roomCode: roomCode,           // ✅ ADD THIS
-                roomName: sensor.room_name,   // ✅ ADD THIS
-                location: roomCode,           // ✅ ADD THIS (for backward compatibility)
+                roomCode: roomCode,
+                roomName: sensor.room_name,
+                location: roomCode,
                 roomId: sensor.room_id,
                 value: value,
                 unit: sensor.unit || '',
@@ -542,7 +507,6 @@ class EnhancedMqttHandler {
         }
     }
 
-
     async handleActuatorMessage(actuator, payload) {
         try {
             console.log(`🎛️ Processing actuator: ${actuator.actuator_name} (${actuator.type_code})`);
@@ -550,25 +514,30 @@ class EnhancedMqttHandler {
             const state = payload.toUpperCase();
             const numericState = state === 'ON' ? 1 : 0;
 
-            // Update actuators table
+            // ✅ CRITICAL FIX: Update actuators table
             await pool.execute(
                 'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
                 [state, actuator.id]
             );
 
-            // Log to actuator_control_logs
+            // ✅ CRITICAL FIX: Log to actuator_control_logs
             await pool.execute(
                 `INSERT INTO actuator_control_logs 
-             (actuator_id, command_value, command_source, executed_at)
-             VALUES (?, ?, 'mqtt', NOW())`,
+                 (actuator_id, command_value, command_source, executed_at)
+                 VALUES (?, ?, 'mqtt', NOW())`,
                 [actuator.id, numericState]
             );
 
-            // Update actuator_states
+            // ✅ CRITICAL FIX: Update actuator_states
             await pool.execute(
                 `INSERT INTO actuator_states 
-             (user_id, room_id, actuator_type, status, message, state, timestamp)
-             VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                 (user_id, room_id, actuator_type, status, message, state, timestamp)
+                 VALUES (?, ?, ?, ?, ?, ?, NOW())
+                 ON DUPLICATE KEY UPDATE
+                 status = VALUES(status),
+                 message = VALUES(message),
+                 state = VALUES(state),
+                 timestamp = VALUES(timestamp)`,
                 [
                     actuator.user_id,
                     actuator.room_id,
@@ -671,32 +640,11 @@ class EnhancedMqttHandler {
         }
         this.activeUsers.get(userId).add(location);
         console.log(`✅ Registered user ${userId} for ${location}`);
-        console.log(`📊 Total active users: ${this.activeUsers.size}`);
     }
 
     unregisterUser(userId) {
         this.activeUsers.delete(userId);
         console.log(`❌ Unregistered user ${userId}`);
-    }
-
-    // ✅ KEEP: All original publish methods
-    publishToESP(topic, message) {
-        return this.publishToTopic(topic, message);
-    }
-
-    publishToActuator(userId, location, message) {
-        const topic = `home/${userId}/${location}/actuator`;
-        return this.publishToTopic(topic, message.toString());
-    }
-
-    publishESPCommand(espDevice, command, value = '') {
-        const message = value ? `${command}:${value}` : command;
-        console.log(`🎛️ Sending command to ${espDevice}: ${message}`);
-        return this.publishToTopic(espDevice, message);
-    }
-
-    publishSimple(topic, message) {
-        return this.publishToTopic(topic, message);
     }
 
     publishToTopic(topic, message) {
