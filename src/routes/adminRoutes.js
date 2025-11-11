@@ -13,16 +13,12 @@ const Admin = require("../models/admin");
 
 const adminRouter = express.Router();
 
-// System Health
+// System Health (no changes needed)
 adminRouter.get("/system-health", authenticate.adminOnly, async (req, res) => {
     try {
-        // Get original system health data
         const originalHealthData = await getSystemHealth();
-
-        // Get enhanced audit data
         const enhancedHealthData = await Admin.getEnhancedSystemHealth();
 
-        // Merge both datasets
         const mergedData = {
             ...originalHealthData.data,
             ...enhancedHealthData,
@@ -39,12 +35,11 @@ adminRouter.get("/system-health", authenticate.adminOnly, async (req, res) => {
     } catch (error) {
         console.error('❌ Error fetching enhanced system health:', error);
 
-        // Fallback to original system health if audit fails
         try {
             const fallbackData = await getSystemHealth();
             return res.status(200).json({
                 ...fallbackData,
-                audit: { recent_actions: 0 }, // Add empty audit data
+                audit: { recent_actions: 0 },
                 fallback: true
             });
         } catch (fallbackError) {
@@ -56,107 +51,131 @@ adminRouter.get("/system-health", authenticate.adminOnly, async (req, res) => {
     }
 });
 
-// User Management
+// User Management - Get All
 adminRouter.get("/users", authenticate.adminOnly, async (req, res) => {
-    getAllUsersAdmin()
-        .then((data) => {
-            return res.status(200).send({
-                status: data.status,
-                message: data.message,
-                users: data.users,
-            });
-        })
-        .catch((error) => {
-            return res.status(400).send({
-                status: error.status,
-                message: error.message,
-            });
+    try {
+        const data = await getAllUsersAdmin();
+        return res.status(200).json({
+            status: data.status,
+            message: data.message,
+            users: data.users,
         });
+    } catch (error) {
+        return res.status(400).json({
+            status: error.status || 'error',
+            message: error.message,
+        });
+    }
 });
 
+// User Management - Create
 adminRouter.post("/users", authenticate.adminOnly, async (req, res) => {
-    createUserAdmin(req.body)
-        .then((data) => {
-            return res.status(201).send({
-                status: data.status,
-                message: data.message,
-                userId: data.userId,
-            });
-        })
-        .catch((error) => {
-            return res.status(400).send({
-                status: error.status,
-                message: error.message,
-            });
+    try {
+        const data = await createUserAdmin(req.body);
+        return res.status(201).json({
+            status: data.status,
+            message: data.message,
+            userId: data.userId,
         });
+    } catch (error) {
+        return res.status(400).json({
+            status: error.status || 'error',
+            message: error.message,
+        });
+    }
 });
 
+// ✅ FIXED: User Management - Update
 adminRouter.put("/users/:id", authenticate.adminOnly, async (req, res) => {
-    updateUserAdmin(req.params.id, req.body, req.user)
-        .then((data) => {
-            return res.status(200).send({
-                status: data.status,
-                message: data.message,
+    try {
+        const userId = req.params.id;
+        const updateData = req.body;
+
+        console.log(`📝 [Route] Updating user ${userId} with:`, updateData);
+
+        // Validate that at least one field is provided
+        if (!updateData.username && !updateData.role &&
+            updateData.email === undefined && updateData.is_active === undefined) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'At least one field must be provided to update'
             });
-        })
-        .catch((error) => {
-            return res.status(400).send({
-                status: error.status,
-                message: error.message,
-            });
+        }
+
+        // Call Admin.updateUser directly with proper error handling
+        await Admin.updateUser(userId, updateData);
+
+        return res.status(200).json({
+            status: 'success',
+            message: 'User updated successfully',
+            userId: userId
         });
+
+    } catch (error) {
+        console.error('❌ [Route] Error updating user:', error);
+        return res.status(500).json({
+            status: 'error',
+            message: error.message || 'Failed to update user'
+        });
+    }
 });
 
+// ✅ FIXED: User Management - Delete (with hard delete option)
 adminRouter.delete("/users/:id", authenticate.adminOnly, async (req, res) => {
-    deleteUserAdmin(req.params.id, req.user)
-        .then((data) => {
-            return res.status(200).send({
-                status: data.status,
-                message: data.message,
-            });
-        })
-        .catch((error) => {
-            return res.status(400).send({
-                status: error.status,
-                message: error.message,
-            });
+    try {
+        const userId = req.params.id;
+
+        console.log(`🗑️ [Route] Permanently deleting user ${userId}`);
+
+        // Call hard delete directly
+        await Admin.deleteUser(userId);
+
+        return res.status(200).json({
+            status: 'success',
+            message: 'User permanently deleted'
         });
+
+    } catch (error) {
+        console.error('❌ [Route] Error deleting user:', error);
+        return res.status(500).json({
+            status: 'error',
+            message: error.message || 'Failed to delete user'
+        });
+    }
 });
 
 // Activity Logs
 adminRouter.get("/activity-logs", authenticate.adminOnly, async (req, res) => {
-    getActivityLogs(req.query)
-        .then((data) => {
-            return res.status(200).send({
-                status: data.status,
-                message: data.message,
-                data: data.data,
-            });
-        })
-        .catch((error) => {
-            return res.status(400).send({
-                status: error.status,
-                message: error.message,
-            });
+    try {
+        const data = await getActivityLogs(req.query);
+        return res.status(200).json({
+            status: data.status,
+            message: data.message,
+            data: data.data,
         });
+    } catch (error) {
+        return res.status(400).json({
+            status: error.status || 'error',
+            message: error.message,
+        });
+    }
 });
 
 // Temperature Analytics
 adminRouter.get("/temperature-analytics", authenticate.adminOnly, async (req, res) => {
-    getTemperatureAnalytics(req.query)
-        .then((data) => {
-            return res.status(200).send({
-                status: data.status,
-                message: data.message,
-                data: data.data,
-            });
-        })
-        .catch((error) => {
-            return res.status(400).send({
-                status: error.status,
-                message: error.message,
-            });
+    try {
+        const data = await getTemperatureAnalytics(req.query);
+        return res.status(200).json({
+            status: data.status,
+            message: data.message,
+            data: data.data,
         });
+    } catch (error) {
+        return res.status(400).json({
+            status: error.status || 'error',
+            message: error.message,
+        });
+    }
 });
 
 // Audit Trail Route
@@ -228,7 +247,7 @@ adminRouter.get('/audit-statistics', authenticate.adminOnly, async (req, res) =>
     }
 });
 
-// Real-time Audit Stream Route (Bonus)
+// Real-time Audit Stream Route
 adminRouter.get('/audit-stream', authenticate.adminOnly, async (req, res) => {
     try {
         const recentActions = await Admin.getAuditTrail({
@@ -253,7 +272,7 @@ adminRouter.get('/audit-stream', authenticate.adminOnly, async (req, res) => {
     }
 });
 
-// Audit Trail Export Route (Additional feature)
+// Audit Trail Export Route
 adminRouter.get('/audit-export', authenticate.adminOnly, async (req, res) => {
     try {
         const filters = {
@@ -275,13 +294,13 @@ adminRouter.get('/audit-export', authenticate.adminOnly, async (req, res) => {
         const csvRows = auditData.map(row => [
             row.id,
             row.user_id,
-            row.username,
+            row.username || 'N/A',
             row.action_type,
-            row.action_description,
-            row.old_value || '',
-            row.new_value,
-            row.location,
-            row.ip_address || '',
+            `"${(row.action_description || '').replace(/"/g, '""')}"`, // Escape quotes
+            `"${(row.old_value || '').replace(/"/g, '""')}"`,
+            `"${(row.new_value || '').replace(/"/g, '""')}"`,
+            row.location || 'N/A',
+            row.ip_address || 'N/A',
             row.created_at
         ].join(',')).join('\n');
 
@@ -295,6 +314,5 @@ adminRouter.get('/audit-export', authenticate.adminOnly, async (req, res) => {
         });
     }
 });
-
 
 module.exports = adminRouter;

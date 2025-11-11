@@ -1,6 +1,7 @@
 // models/admin.js
-// ✅ UPDATED FOR redesigned_iot_database schema
+// ✅ FIXED FOR redesigned_iot_database schema
 const pool = require("../config/db");
+const bcrypt = require("bcrypt");
 
 class Admin {
   // ============================================
@@ -75,7 +76,7 @@ class Admin {
   };
 
   // ============================================
-  // USER MANAGEMENT QUERIES
+  // USER MANAGEMENT QUERIES - ✅ FIXED
   // ============================================
 
   static getAllUsersWithStats = async () => {
@@ -85,7 +86,6 @@ class Admin {
         u.id, 
         u.username, 
         u.email,
-        u.full_name,
         u.role, 
         u.created_at, 
         u.is_active,
@@ -106,10 +106,19 @@ class Admin {
 
   static createUser = async (userData) => {
     console.log(`🔵 [Admin] Creating user: ${userData.username}`);
-    const { username, password, email, full_name, role } = userData;
+    const { username, password, email, role } = userData;
+
+    // Hash password using bcrypt
+    const hashedPassword = await bcrypt.hash(password, 10);
+
     const [result] = await pool.execute(
-      "INSERT INTO users (username, password_hash, email, full_name, role, is_active, created_at) VALUES (?, ?, ?, ?, ?, 1, NOW())",
-      [username, password, email || `${username}@example.com`, full_name || username, role || 'user']
+      "INSERT INTO users (username, password, email, role, is_active, created_at) VALUES (?, ?, ?, ?, 1, NOW())",
+      [
+        username,
+        hashedPassword,
+        email || `${username}@example.com`,
+        role || 'user'
+      ]
     );
     console.log(`✅ [Admin] User created with ID: ${result.insertId}`);
     return result;
@@ -117,25 +126,64 @@ class Admin {
 
   static updateUser = async (userId, userData) => {
     console.log(`🔵 [Admin] Updating user: ${userId}`);
-    const { username, role, email, full_name, is_active } = userData;
-    const [result] = await pool.execute(
-      "UPDATE users SET username = ?, role = ?, email = ?, full_name = ?, is_active = ?, updated_at = NOW() WHERE id = ?",
-      [username, role, email, full_name, is_active, userId]
-    );
-    console.log(`✅ [Admin] User ${userId} updated`);
+    console.log(`📝 [Admin] Update data:`, userData);
+
+    const { username, role, email, is_active } = userData;
+
+    // Build dynamic UPDATE query
+    const updates = [];
+    const params = [];
+
+    if (username !== undefined) {
+      updates.push('username = ?');
+      params.push(username);
+    }
+    if (role !== undefined) {
+      updates.push('role = ?');
+      params.push(role);
+    }
+    if (email !== undefined) {
+      updates.push('email = ?');
+      params.push(email);
+    }
+    if (is_active !== undefined) {
+      updates.push('is_active = ?');
+      params.push(is_active);
+    }
+
+    if (updates.length === 0) {
+      throw new Error('No fields to update');
+    }
+
+    // Always update timestamp
+    updates.push('updated_at = NOW()');
+    params.push(userId);
+
+    const sql = `UPDATE users SET ${updates.join(', ')} WHERE id = ?`;
+
+    console.log(`📝 [Admin] SQL:`, sql);
+    console.log(`📝 [Admin] Params:`, params);
+
+    const [result] = await pool.execute(sql, params);
+    console.log(`✅ [Admin] User ${userId} updated, affected rows: ${result.affectedRows}`);
     return result;
   };
 
+
   static deleteUser = async (userId) => {
-    console.log(`🔵 [Admin] Deleting user: ${userId}`);
-    // Soft delete
+    console.log(`🔵 [Admin] Permanently deleting user: ${userId}`);
+
+    // ✅ Hard delete - CASCADE will handle all related records
     const [result] = await pool.execute(
-      "UPDATE users SET is_active = 0, updated_at = NOW() WHERE id = ?",
+      "DELETE FROM users WHERE id = ?",
       [userId]
     );
-    console.log(`✅ [Admin] User ${userId} deleted (soft)`);
+
+    console.log(`✅ [Admin] User ${userId} permanently deleted`);
+    console.log(`   Affected rows: ${result.affectedRows}`);
     return result;
   };
+
 
   static getUsersCount = async () => {
     console.log(`🔵 [Admin] Getting users count`);
@@ -615,7 +663,6 @@ class Admin {
   static getEnhancedSystemHealth = async () => {
     console.log(`🔵 [Admin] Getting enhanced system health`);
     try {
-      // Get existing system health data
       const activeDevices = await Admin.getActiveDevicesCount();
       const totalDevices = await Admin.getTotalDevicesCount();
       const recentMeasurements = await Admin.getRecentMeasurementsCount();
@@ -626,7 +673,6 @@ class Admin {
       const mqttConnections = await Admin.getMqttConnections();
       const uniqueLocations = await Admin.getUniqueLocationsCount();
 
-      // Process MQTT connections data
       const mqttStats = {
         connect: 0,
         disconnect: 0,
@@ -666,7 +712,6 @@ class Admin {
     } catch (error) {
       console.error('❌ [Admin] Error in getEnhancedSystemHealth:', error);
 
-      // Return safe defaults if anything fails
       return {
         devices: { total: 0, active: 0, offline: 0, locations: 0 },
         users: { total: 0, active: 0 },

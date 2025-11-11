@@ -1062,6 +1062,69 @@ locationRouter.get("/locations/:location/sensors", adminOrUser, async (req, res)
     }
 });
 
+
+// GET /api/sensors - Get sensors with optional location filter
+locationRouter.get("/sensors", adminOrUser, async (req, res) => {
+    console.log(`🔵 [Route GET /sensors] User: ${req.user.id}`);
+
+    try {
+        const userId = req.user.id;
+        const location = req.query.location; // ✅ Get location from query params
+
+        console.log(`🔵 [Route] Fetching sensors for user: ${userId}, location: ${location || 'ALL'}`);
+
+        let query = `
+            SELECT 
+                s.id,
+                s.sensor_code,
+                s.sensor_name,
+                s.mqtt_topic,
+                st.type_code,
+                st.type_name,
+                st.unit,
+                s.is_active,
+                r.room_code as location,
+                r.room_name,
+                s.last_reading_at,
+                (SELECT measured_value 
+                 FROM sensor_measurements 
+                 WHERE sensor_id = s.id 
+                 ORDER BY measured_at DESC 
+                 LIMIT 1) as last_reading
+            FROM sensors s
+            INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+            INNER JOIN rooms r ON s.room_id = r.id
+            WHERE s.user_id = ?
+        `;
+
+        const params = [userId];
+
+        // ✅ ADD: Filter by location if provided
+        if (location) {
+            query += ` AND r.room_code = ?`;
+            params.push(location);
+        }
+
+        query += ` ORDER BY s.id`;
+
+        const [sensors] = await pool.execute(query, params);
+
+        console.log(`✅ [Route] Found ${sensors.length} sensors`);
+
+        res.json({
+            status: 'success',
+            sensors: sensors || []
+        });
+
+    } catch (error) {
+        console.error('❌ [Route GET /sensors] Error:', error.message);
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch sensors'
+        });
+    }
+});
+
 // GET /api/locations/:roomId/devices - Get all sensors and actuators for a room
 locationRouter.get("/locations/:roomId/devices", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route GET /locations/:roomId/devices] User: ${req.user.id}`);
