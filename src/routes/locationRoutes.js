@@ -415,9 +415,6 @@ locationRouter.get("/locations/:location/bowl-history", adminOrUser, async (req,
 // routes/locationRoutes.js - ADD these new endpoints
 
 // POST /api/locations/create-room - Create room with MQTT auto-subscription
-// POST /api/locations/create-room - Create room with MQTT auto-subscription
-// POST /api/locations/create-room - Create room with MQTT auto-subscription
-// POST /api/locations/create-room - Create room with MQTT auto-subscription
 locationRouter.post("/locations/create-room", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route POST /locations/create-room] User: ${req.user.id}`);
 
@@ -619,8 +616,6 @@ locationRouter.post("/locations/create-room", adminOrUser, async (req, res) => {
 
 
 // GET /api/actuator-types - Get all available actuator types
-// GET /api/actuator-types - Get all available actuator types
-// GET /api/actuator-types - Get all available actuator types
 locationRouter.get("/actuator-types", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route GET /actuator-types] User: ${req.user.id}`);
 
@@ -679,6 +674,7 @@ function getActuatorIcon(typeCode) {
 
 
 // PUT /api/locations/:roomId/update - Update room and MQTT topics
+// PUT /api/locations/:roomId/update - Update room and MQTT topics (FIXED)
 locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route PUT /locations/:roomId/update] User: ${req.user.id}`);
 
@@ -746,7 +742,6 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
 
                     // MQTT: Unsubscribe from old topic and subscribe to new one
                     if (client && oldTopic !== newMqttTopic) {
-                        // Unsubscribe from old topic
                         client.unsubscribe(oldTopic, (err) => {
                             if (!err) {
                                 console.log(`🔌 MQTT: Unsubscribed from old sensor topic: ${oldTopic}`);
@@ -755,7 +750,6 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
                             }
                         });
 
-                        // Subscribe to new topic
                         client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
                             if (!err) {
                                 console.log(`🔌 MQTT: Subscribed to new sensor topic: ${newMqttTopic}`);
@@ -770,23 +764,37 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
             }
         }
 
-        // Update actuator MQTT topics if provided
+        // ✅ FIXED: Update actuator MQTT topics if provided (CREATE IF NOT EXISTS)
         if (actuatorTopics && Object.keys(actuatorTopics).length > 0) {
             for (const [actuatorType, newMqttTopic] of Object.entries(actuatorTopics)) {
-                // Get existing actuator
+                // Get actuator type info from database
+                const [actuatorTypeInfo] = await pool.execute(
+                    `SELECT id, type_name FROM actuator_types WHERE type_code = ?`,
+                    [actuatorType]
+                );
+
+                if (actuatorTypeInfo.length === 0) {
+                    console.warn(`⚠️ [Route] Actuator type not found: ${actuatorType}`);
+                    continue;
+                }
+
+                const actuatorTypeId = actuatorTypeInfo[0].id;
+                const actuatorTypeName = actuatorTypeInfo[0].type_name;
+
+                // Check if actuator already exists
                 const [existingActuators] = await pool.execute(
                     `SELECT a.id, a.mqtt_topic, at.type_code 
-                     FROM actuators a
-                     JOIN actuator_types at ON a.actuator_type_id = at.id
-                     WHERE a.room_id = ? AND a.user_id = ? AND at.type_code = ? AND a.is_active = 1`,
+             FROM actuators a
+             JOIN actuator_types at ON a.actuator_type_id = at.id
+             WHERE a.room_id = ? AND a.user_id = ? AND at.type_code = ? AND a.is_active = 1`,
                     [roomId, userId, actuatorType]
                 );
 
                 if (existingActuators.length > 0) {
+                    // ✅ EXISTING ACTUATOR: Update MQTT topic
                     const oldTopic = existingActuators[0].mqtt_topic;
                     const actuatorId = existingActuators[0].id;
 
-                    // Update MQTT topic in database
                     await pool.execute(
                         'UPDATE actuators SET mqtt_topic = ? WHERE id = ?',
                         [newMqttTopic, actuatorId]
@@ -794,7 +802,6 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
 
                     // MQTT: Unsubscribe from old topic and subscribe to new one
                     if (client && oldTopic !== newMqttTopic) {
-                        // Unsubscribe from old topic
                         client.unsubscribe(oldTopic, (err) => {
                             if (!err) {
                                 console.log(`🔌 MQTT: Unsubscribed from old actuator topic: ${oldTopic}`);
@@ -803,7 +810,6 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
                             }
                         });
 
-                        // Subscribe to new topic
                         client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
                             if (!err) {
                                 console.log(`🔌 MQTT: Subscribed to new actuator topic: ${newMqttTopic}`);
@@ -814,6 +820,34 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
                     }
 
                     console.log(`✅ [Route] Updated actuator ${actuatorType}: ${oldTopic} → ${newMqttTopic}`);
+                } else {
+                    // ✅ NEW ACTUATOR: Create it with the MQTT topic (FIXED - removed target_state)
+                    const [actuatorResult] = await pool.execute(
+                        `INSERT INTO actuators 
+                 (user_id, room_id, actuator_type_id, actuator_code, actuator_name, mqtt_topic, is_active, current_state) 
+                 VALUES (?, ?, ?, ?, ?, ?, 1, 'off')`,
+                        [
+                            userId,
+                            roomId,
+                            actuatorTypeId,
+                            `${actuatorType.toUpperCase()}_${roomId}`,
+                            `${actuatorTypeName} - ${roomName}`,
+                            newMqttTopic
+                        ]
+                    );
+
+                    // MQTT: Subscribe to new topic
+                    if (client) {
+                        client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
+                            if (!err) {
+                                console.log(`🔌 MQTT: Subscribed to new actuator topic: ${newMqttTopic}`);
+                            } else {
+                                console.error(`❌ MQTT: Failed to subscribe to ${newMqttTopic}:`, err);
+                            }
+                        });
+                    }
+
+                    console.log(`✅ [Route] Created NEW actuator ${actuatorType} with ID: ${actuatorResult.insertId} and topic: ${newMqttTopic}`);
                 }
             }
         }
@@ -859,8 +893,6 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
 
 // ==================== DELETE ROUTE (FIXED) ====================
 
-// DELETE /api/locations/:roomId - Delete room and unsubscribe from MQTT topics
-// DELETE /api/locations/:roomId - Delete room and unsubscribe from MQTT topics
 // DELETE /api/locations/:roomId - Hard delete room and all related data
 locationRouter.delete("/locations/:roomId", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route DELETE /locations/:roomId] User: ${req.user.id}`);

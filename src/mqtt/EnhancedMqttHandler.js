@@ -8,6 +8,7 @@ const BowlFanHandler = require('./Actuators/BowlFanHandler');
 const SonarPumpHandler = require('./Actuators/SonarPumpHandler');
 const CO2FermentationHandler = require('./Actuators/CO2FermentationHandler');
 const SugarFermentationHandler = require('./Actuators/SugarFermentationHandler');
+const CameraMonitoringHandler = require('./Actuators/CameraMonitoringHandler');
 
 class EnhancedMqttHandler {
     constructor(io) {
@@ -69,6 +70,13 @@ class EnhancedMqttHandler {
         );
 
         this.sugarFermentationHandler = new SugarFermentationHandler(
+            this.io,
+            this.sensorData,
+            this.activeUsers,
+            this.sensorDataMutex
+        );
+
+        this.cameraMonitoringHandler = new CameraMonitoringHandler(
             this.io,
             this.sensorData,
             this.activeUsers,
@@ -295,6 +303,12 @@ class EnhancedMqttHandler {
         console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${payload}`);
 
         try {
+
+            if (payload.includes('detected in')) {
+                console.log(`📹 [EnhancedMqttHandler] Detected camera message on topic: ${topic}`);
+                await this.cameraMonitoringHandler.handleCameraDetectionData(topic, payload);
+                return;
+            }
             // ✅ CRITICAL FIX: Check if it's an actuator topic FIRST
             if (this.isActuatorTopic(topic)) {
                 await this.handleActuatorTopic(topic, payload);
@@ -514,44 +528,62 @@ class EnhancedMqttHandler {
             const state = payload.toUpperCase();
             const numericState = state === 'ON' ? 1 : 0;
 
-            // ✅ CRITICAL FIX: Update actuators table
+            // ✅ FIX 1: Update actuators table (use lowercase for state)
             await pool.execute(
                 'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
-                [state, actuator.id]
+                [state.toLowerCase(), actuator.id]
             );
 
-            // ✅ CRITICAL FIX: Log to actuator_control_logs
+            // ✅ FIX 2: Log to actuator_control_logs
             await pool.execute(
                 `INSERT INTO actuator_control_logs 
-                 (actuator_id, command_value, command_source, executed_at)
-                 VALUES (?, ?, 'mqtt', NOW())`,
+             (actuator_id, command_value, command_source, executed_at)
+             VALUES (?, ?, 'mqtt', NOW())`,
                 [actuator.id, numericState]
             );
 
-            // ✅ CRITICAL FIX: Update actuator_states
-            await pool.execute(
-                `INSERT INTO actuator_states 
-                 (user_id, room_id, actuator_type, status, message, state, timestamp)
-                 VALUES (?, ?, ?, ?, ?, ?, NOW())
-                 ON DUPLICATE KEY UPDATE
-                 status = VALUES(status),
-                 message = VALUES(message),
-                 state = VALUES(state),
-                 timestamp = VALUES(timestamp)`,
-                [
-                    actuator.user_id,
-                    actuator.room_id,
-                    actuator.type_code,
-                    state,
-                    this.getActuatorMessage(actuator.type_code, state),
-                    numericState
-                ]
+            // ✅ FIX 3: Update actuator_states with proper type_code
+            // First check if record exists
+            const [existingState] = await pool.execute(
+                `SELECT id FROM actuator_states 
+             WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
+                [actuator.user_id, actuator.room_id, actuator.type_code]
             );
 
-            console.log(`✅ Logged actuator: ${state} for ${actuator.actuator_name}`);
+            if (existingState.length > 0) {
+                // Update existing
+                await pool.execute(
+                    `UPDATE actuator_states 
+                 SET status = ?, message = ?, state = ?, timestamp = NOW()
+                 WHERE id = ?`,
+                    [
+                        state,
+                        this.getActuatorMessage(actuator.type_code, state),
+                        numericState,
+                        existingState[0].id
+                    ]
+                );
+            } else {
+                // Insert new - using type_code directly
+                await pool.execute(
+                    `INSERT INTO actuator_states 
+                 (user_id, room_id, actuator_type, status, message, state, timestamp)
+                 VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                    [
+                        actuator.user_id,
+                        actuator.room_id,
+                        actuator.type_code, // ✅ This will now work with VARCHAR
+                        state,
+                        this.getActuatorMessage(actuator.type_code, state),
+                        numericState
+                    ]
+                );
+            }
+
+            console.log(`✅ Logged actuator state for ${actuator.actuator_name}: ${state}`);
 
             // Emit to frontend
-            const roomCode = actuator.room_code || 'unknown';
+            const roomCode = actuator.room_code || actuator.room_name || 'unknown';
             const timestamp = new Date().toISOString();
 
             this.io.to(`user_${actuator.user_id}_${roomCode}`).emit('actuatorUpdate', {
@@ -567,9 +599,11 @@ class EnhancedMqttHandler {
             });
 
         } catch (error) {
-            console.error(`❌ Error handling actuator:`, error.message);
+            console.error(`❌ Error handling actuator ${actuator.actuator_name}:`, error.message);
+            console.error(`❌ Stack:`, error.stack);
         }
     }
+
 
     getActuatorMessage(typeCode, state) {
         const messages = {
