@@ -9,6 +9,7 @@ const adminRoutes = require("./adminRoutes");
 const cameraRoutes = require("./cameraRoutes");
 const environmentRoutes = require("./environmentRoutes");
 const sensorRoutes = require("./sensorRoutes");
+const actuatorRouter = require("./actuatorRoutes");
 
 const setupRoutes = (app) => {
     app.use("/api", authRoutes);
@@ -22,6 +23,8 @@ const setupRoutes = (app) => {
     app.use("/api/camera", cameraRoutes);
     app.use("/api/environment", environmentRoutes);
     app.use("/api/sensors", sensorRoutes);
+    app.use('/api/actuators', actuatorRouter);
+
 
     // Health check endpoint
     app.get("/health", (req, res) => {

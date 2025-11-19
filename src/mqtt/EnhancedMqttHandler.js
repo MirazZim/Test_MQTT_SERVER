@@ -1,4 +1,4 @@
-// src/mqtt/EnhancedMqttHandler.js - FIXED VERSION
+// src/mqtt/EnhancedMqttHandler.js - FINAL OPTIMIZED VERSION
 const { Mutex } = require("async-mutex");
 const MqttConnection = require('./connection/MqttConnection');
 const pool = require('../config/db');
@@ -39,13 +39,11 @@ class EnhancedMqttHandler {
         this.locationMutexes = new Map();
         this.cleanupInterval = null;
 
-        // ✅ CRITICAL FIX: Initialize actuator handlers
         this.initializeActuatorHandlers();
 
         console.log(`✅ [EnhancedMqttHandler] Initialized with dynamic handler`);
     }
 
-    // ✅ NEW: Initialize actuator handlers
     initializeActuatorHandlers() {
         console.log(`🔵 [EnhancedMqttHandler] Initializing actuator handlers...`);
 
@@ -99,6 +97,21 @@ class EnhancedMqttHandler {
         this.io.on('connection', (socket) => {
             console.log(`🔌 Client connected: ${socket.id}`);
 
+            // ✅ FIXED: Handle MQTT publish from frontend
+            socket.on('publishTextToMQTT', (data) => {
+                console.log(`📤 Publishing MQTT: ${data.topic} = ${data.message}`);
+
+                // ✅ Use 'this' instead of 'mqttHandler'
+                if (!this.mqttClient || !this.mqttClient.connected) {
+                    console.error('❌ MQTT client not connected!');
+                    socket.emit('publishError', { message: 'MQTT client not connected' });
+                    return;
+                }
+
+                // ✅ Use 'this' to call publishToTopic
+                this.publishToTopic(data.topic, data.message);
+            });
+
             socket.on('joinRoom', (room) => {
                 socket.join(room);
                 console.log(`✅ Socket ${socket.id} joined room: ${room}`);
@@ -114,6 +127,7 @@ class EnhancedMqttHandler {
             });
         });
     }
+
 
     connect() {
         console.log(`🔵 [EnhancedMqttHandler] Connecting to MQTT broker...`);
@@ -152,13 +166,9 @@ class EnhancedMqttHandler {
         this.mqttClient = client;
 
         try {
-            // Subscribe to legacy topics
             await this.subscribeLegacyTopics(client);
-
-            // Subscribe to dynamic database topics
             await this.subscribeToAllActiveSensors(client);
             await this.subscribeToAllActiveActuators(client);
-
         } catch (error) {
             console.error('❌ [EnhancedMqttHandler] Error during initial subscription:', error);
         }
@@ -170,13 +180,8 @@ class EnhancedMqttHandler {
             'CO2', 'sugar', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
         ];
 
-        // ✅ CRITICAL FIX: Actuator topics
         const legacyActuatorTopics = [
-            'bowlT',    // bowl_fan_status
-            'sonarT',   // sonar_pump_status
-            'CO2T',     // co2_fermentation_status
-            'sugarT',    // sugar_fermentation_status
-            'ESP_S_10'
+            'bowlT', 'sonarT', 'CO2T', 'sugarT', 'ESP_S_10'
         ];
 
         for (const topic of legacySensorTopics) {
@@ -202,7 +207,6 @@ class EnhancedMqttHandler {
             }
         }
 
-        // ✅ CRITICAL FIX: Subscribe to actuator topics
         for (const topic of legacyActuatorTopics) {
             if (!this.subscribedTopics.has(topic)) {
                 try {
@@ -268,13 +272,18 @@ class EnhancedMqttHandler {
     async subscribeToAllActiveActuators(client) {
         try {
             const [actuators] = await pool.execute(
-                `SELECT DISTINCT a.mqtt_topic, at.type_code, at.type_name
-                 FROM actuators a
-                 INNER JOIN actuator_types at ON a.actuator_type_id = at.id
-                 WHERE a.is_active = 1 AND a.mqtt_topic IS NOT NULL AND a.mqtt_topic != ''`
+                `SELECT DISTINCT a.mqtt_topic, at.type_code, at.type_name, at.control_type
+             FROM actuators a
+             INNER JOIN actuator_types at ON a.actuator_type_id = at.id
+             WHERE a.is_active = 1 AND a.mqtt_topic IS NOT NULL AND a.mqtt_topic != ''`
             );
 
             console.log(`📡 [EnhancedMqttHandler] Found ${actuators.length} active actuator topics`);
+
+            // ✅ ADD THIS: Log all actuators found
+            actuators.forEach(act => {
+                console.log(`   📋 Found actuator topic: ${act.mqtt_topic} (${act.type_name}, control_type: ${act.control_type})`);
+            });
 
             for (const actuator of actuators) {
                 if (!this.subscribedTopics.has(actuator.mqtt_topic)) {
@@ -286,7 +295,7 @@ class EnhancedMqttHandler {
                                 clearTimeout(timeout);
                                 if (!err) {
                                     this.subscribedTopics.add(actuator.mqtt_topic);
-                                    console.log(`✅ Subscribed to actuator: ${actuator.mqtt_topic} (${actuator.type_name})`);
+                                    console.log(`✅ Subscribed to actuator: ${actuator.mqtt_topic} (${actuator.type_name}, control_type: ${actuator.control_type})`);
                                     resolve();
                                 } else {
                                     reject(err);
@@ -296,12 +305,20 @@ class EnhancedMqttHandler {
                     } catch (subscribeError) {
                         console.error(`❌ Subscribe error for ${actuator.mqtt_topic}:`, subscribeError.message);
                     }
+                } else {
+                    console.log(`⚠️ Already subscribed to: ${actuator.mqtt_topic}`);
                 }
             }
+
+            // ✅ ADD THIS: Log final subscribed topics
+            console.log(`📡 [EnhancedMqttHandler] Total subscribed topics: ${this.subscribedTopics.size}`);
+            console.log(`📡 [EnhancedMqttHandler] Subscribed topics:`, Array.from(this.subscribedTopics));
+
         } catch (error) {
             console.error('❌ Database error subscribing to actuators:', error.message);
         }
     }
+
 
     async onMessage(topic, message) {
         if (message.length > 10000) {
@@ -312,26 +329,31 @@ class EnhancedMqttHandler {
         const payload = message.toString('utf8');
         console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${payload}`);
 
-        try {
+        // ✅ ADD THIS: Log ALL incoming messages
+        console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${payload}`);
 
+        // ✅ ADD THIS: Check if subscribed
+        if (!this.subscribedTopics.has(topic)) {
+            console.warn(`⚠️ Received message on NON-SUBSCRIBED topic: ${topic}`);
+        }
+
+        try {
             if (payload.includes('detected in')) {
                 console.log(`📹 [EnhancedMqttHandler] Detected camera message on topic: ${topic}`);
                 await this.cameraMonitoringHandler.handleCameraDetectionData(topic, payload);
                 return;
             }
-            // ✅ CRITICAL FIX: Check if it's an actuator topic FIRST
+
             if (this.isActuatorTopic(topic)) {
                 await this.handleActuatorTopic(topic, payload);
                 return;
             }
 
-            // Then check legacy sensor topics
             if (this.isLegacyTopic(topic)) {
                 await this.handleLegacyTopic(topic, payload);
                 return;
             }
 
-            // Finally check dynamic database topics
             await this.handleDynamicMessage(topic, payload);
 
         } catch (error) {
@@ -339,13 +361,11 @@ class EnhancedMqttHandler {
         }
     }
 
-    // ✅ CRITICAL FIX: New method to identify actuator topics
     isActuatorTopic(topic) {
         const actuatorTopics = ['bowlT', 'sonarT', 'CO2T', 'sugarT', 'ESP_S_10'];
         return actuatorTopics.includes(topic);
     }
 
-    // ✅ CRITICAL FIX: New method to handle actuator topics
     async handleActuatorTopic(topic, payload) {
         console.log(`🎛️ [EnhancedMqttHandler] Handling actuator topic: ${topic}`);
 
@@ -366,7 +386,6 @@ class EnhancedMqttHandler {
                 case 'ESP_S_10':
                     await this.resultsHandler.handleResultsData(topic, payload);
                     break;
-
                 default:
                     console.warn(`⚠️ Unknown actuator topic: ${topic}`);
             }
@@ -441,9 +460,9 @@ class EnhancedMqttHandler {
                 return;
             }
 
-            // Check actuators
+            // ✅ OPTIMIZED: Include control_type in query
             const [actuators] = await pool.execute(
-                `SELECT a.*, at.type_code, at.type_name, 
+                `SELECT a.*, at.type_code, at.type_name, at.control_type,
                     r.room_code, r.room_name, r.id as room_id
                  FROM actuators a
                  INNER JOIN actuator_types at ON a.actuator_type_id = at.id
@@ -539,37 +558,49 @@ class EnhancedMqttHandler {
         try {
             console.log(`🎛️ Processing actuator: ${actuator.actuator_name} (${actuator.type_code})`);
 
+            // ✅ OPTIMIZED: Use control_type from query result
+            const controlType = actuator.control_type || 'binary';
+
+            if (controlType === 'analog') {
+                await this.handleAnalogActuator(actuator, payload);
+            } else {
+                await this.handleBinaryActuator(actuator, payload);
+            }
+
+        } catch (error) {
+            console.error(`❌ Error handling actuator ${actuator.actuator_name}:`, error.message);
+            console.error(`❌ Stack:`, error.stack);
+        }
+    }
+
+    async handleBinaryActuator(actuator, payload) {
+        try {
             const state = payload.toUpperCase();
             const numericState = state === 'ON' ? 1 : 0;
 
-            // ✅ FIX 1: Update actuators table (use lowercase for state)
             await pool.execute(
                 'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
                 [state.toLowerCase(), actuator.id]
             );
 
-            // ✅ FIX 2: Log to actuator_control_logs
             await pool.execute(
                 `INSERT INTO actuator_control_logs 
-             (actuator_id, command_value, command_source, executed_at)
-             VALUES (?, ?, 'mqtt', NOW())`,
+                 (actuator_id, command_value, command_source, executed_at)
+                 VALUES (?, ?, 'mqtt', NOW())`,
                 [actuator.id, numericState]
             );
 
-            // ✅ FIX 3: Update actuator_states with proper type_code
-            // First check if record exists
             const [existingState] = await pool.execute(
                 `SELECT id FROM actuator_states 
-             WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
+                 WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
                 [actuator.user_id, actuator.room_id, actuator.type_code]
             );
 
             if (existingState.length > 0) {
-                // Update existing
                 await pool.execute(
                     `UPDATE actuator_states 
-                 SET status = ?, message = ?, state = ?, timestamp = NOW()
-                 WHERE id = ?`,
+                     SET status = ?, message = ?, state = ?, timestamp = NOW()
+                     WHERE id = ?`,
                     [
                         state,
                         this.getActuatorMessage(actuator.type_code, state),
@@ -578,15 +609,14 @@ class EnhancedMqttHandler {
                     ]
                 );
             } else {
-                // Insert new - using type_code directly
                 await pool.execute(
                     `INSERT INTO actuator_states 
-                 (user_id, room_id, actuator_type, status, message, state, timestamp)
-                 VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                     (user_id, room_id, actuator_type, status, message, state, timestamp)
+                     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
                     [
                         actuator.user_id,
                         actuator.room_id,
-                        actuator.type_code, // ✅ This will now work with VARCHAR
+                        actuator.type_code,
                         state,
                         this.getActuatorMessage(actuator.type_code, state),
                         numericState
@@ -594,11 +624,14 @@ class EnhancedMqttHandler {
                 );
             }
 
-            console.log(`✅ Logged actuator state for ${actuator.actuator_name}: ${state}`);
+            console.log(`✅ Logged binary actuator state: ${state}`);
 
-            // Emit to frontend
-            const roomCode = actuator.room_code || actuator.room_name || 'unknown';
-            const timestamp = new Date().toISOString();
+            // ✅ OPTIMIZED: Validate room code
+            const roomCode = actuator.room_code || actuator.room_name;
+            if (!roomCode) {
+                console.warn(`⚠️ No room code for actuator ${actuator.actuator_name}`);
+                return;
+            }
 
             this.io.to(`user_${actuator.user_id}_${roomCode}`).emit('actuatorUpdate', {
                 actuatorId: actuator.id,
@@ -608,16 +641,120 @@ class EnhancedMqttHandler {
                 roomName: actuator.room_name,
                 state: state,
                 numericState: numericState,
-                timestamp: timestamp,
+                timestamp: new Date().toISOString(),
                 topic: actuator.mqtt_topic
             });
 
         } catch (error) {
-            console.error(`❌ Error handling actuator ${actuator.actuator_name}:`, error.message);
-            console.error(`❌ Stack:`, error.stack);
+            console.error(`❌ Error in handleBinaryActuator:`, error.message);
+            throw error;
         }
     }
 
+    async handleAnalogActuator(actuator, payload) {
+        try {
+            const value = parseInt(payload);
+
+            if (isNaN(value) || value < 0 || value > 100) {
+                console.warn(`⚠️ Invalid analog value: ${payload} (must be 0-100)`);
+                return;
+            }
+
+            let status = '';
+            let statusMessage = '';
+
+            if (value === 0) {
+                status = 'OFF';
+                statusMessage = `⏸️ ${actuator.actuator_name} is OFF`;
+            } else if (value <= 33) {
+                status = 'LOW';
+                statusMessage = `🌀 ${actuator.actuator_name}: LOW (${value}%)`;
+            } else if (value <= 66) {
+                status = 'MEDIUM';
+                statusMessage = `🌀 ${actuator.actuator_name}: MEDIUM (${value}%)`;
+            } else {
+                status = 'HIGH';
+                statusMessage = `🌀 ${actuator.actuator_name}: HIGH (${value}%)`;
+            }
+
+            await pool.execute(
+                'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
+                [value.toString(), actuator.id]
+            );
+
+            await pool.execute(
+                `INSERT INTO actuator_control_logs 
+                 (actuator_id, command_value, command_source, executed_at)
+                 VALUES (?, ?, 'mqtt', NOW())`,
+                [actuator.id, value]
+            );
+
+            const [existingState] = await pool.execute(
+                `SELECT id FROM actuator_states 
+                 WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
+                [actuator.user_id, actuator.room_id, actuator.type_code]
+            );
+
+            if (existingState.length > 0) {
+                await pool.execute(
+                    `UPDATE actuator_states 
+                     SET status = ?, message = ?, state = ?, timestamp = NOW()
+                     WHERE id = ?`,
+                    [status, statusMessage, value, existingState[0].id]
+                );
+            } else {
+                await pool.execute(
+                    `INSERT INTO actuator_states 
+                     (user_id, room_id, actuator_type, status, message, state, timestamp)
+                     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                    [
+                        actuator.user_id,
+                        actuator.room_id,
+                        actuator.type_code,
+                        status,
+                        statusMessage,
+                        value
+                    ]
+                );
+            }
+
+            console.log(`✅ Logged analog actuator: ${actuator.actuator_name} = ${value}%`);
+
+            // ✅ OPTIMIZED: Validate room code
+            const roomCode = actuator.room_code || actuator.room_name;
+            if (!roomCode) {
+                console.warn(`⚠️ No room code for actuator ${actuator.actuator_name}`);
+                return;
+            }
+
+            this.io.to(`user_${actuator.user_id}_${roomCode}`).emit('actuatorUpdate', {
+                actuatorId: actuator.id,
+                actuatorType: actuator.type_code,
+                actuatorName: actuator.actuator_name,
+                roomCode: roomCode,
+                roomName: actuator.room_name,
+                state: status,
+                value: value,
+                timestamp: new Date().toISOString(),
+                topic: actuator.mqtt_topic
+            });
+
+            if (actuator.type_code === 'fan_speed_control') {
+                this.io.to(`user_${actuator.user_id}_${roomCode}`).emit('fanSpeedUpdate', {
+                    speed: value,
+                    status: status,
+                    level: status,
+                    roomCode: roomCode,
+                    roomId: actuator.room_id,
+                    timestamp: new Date().toISOString()
+                });
+            }
+
+        } catch (error) {
+            console.error(`❌ Error in handleAnalogActuator:`, error.message);
+            throw error;
+        }
+    }
 
     getActuatorMessage(typeCode, state) {
         const messages = {
