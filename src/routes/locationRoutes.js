@@ -890,6 +890,66 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
     }
 });
 
+// // GET /api/rooms/by-code/:roomCode - Get room details by room code
+// locationRouter.get("/rooms/by-code/:roomCode", adminOrUser, async (req, res) => {
+//     console.log(`🔵 [Route GET /rooms/by-code/:roomCode] User: ${req.user.id}`);
+
+//     try {
+//         const { roomCode } = req.params;
+//         const userId = req.user.id;
+
+//         console.log(`🔵 [Route] Fetching room - User: ${userId}, Code: ${roomCode}`);
+
+//         const [rooms] = await pool.execute(
+//             `SELECT 
+//                 id, 
+//                 room_code, 
+//                 room_name, 
+//                 floor_number, 
+//                 x_coordinate, 
+//                 y_coordinate,
+//                 description,
+//                 created_at
+//              FROM rooms 
+//              WHERE user_id = ? AND room_code = ? AND is_active = 1 
+//              LIMIT 1`,
+//             [userId, roomCode]
+//         );
+
+//         if (rooms.length === 0) {
+//             console.log(`❌ [Route] Room not found for user ${userId}, code: ${roomCode}`);
+
+//             // Debug: Show all available rooms for this user
+//             const [allRooms] = await pool.execute(
+//                 'SELECT id, room_code, room_name FROM rooms WHERE user_id = ? AND is_active = 1',
+//                 [userId]
+//             );
+//             console.log(`🔍 [Route] Available rooms for user:`, allRooms);
+
+//             return res.status(404).json({
+//                 status: 'error',
+//                 message: 'Room not found',
+//                 searchedFor: roomCode,
+//                 availableRooms: allRooms.map(r => r.room_code)
+//             });
+//         }
+
+//         console.log(`✅ [Route] Room found:`, rooms[0]);
+
+//         res.json({
+//             status: 'success',
+//             room: rooms[0]
+//         });
+
+//     } catch (error) {
+//         console.error('[API] Error fetching room:', error);
+//         res.status(500).json({
+//             status: 'error',
+//             error: error.message
+//         });
+//     }
+// });
+
 
 // ==================== DELETE ROUTE (FIXED) ====================
 

@@ -18,6 +18,7 @@ class EnhancedMqttHandler {
         this.mqttClient = null;
         this.activeUsers = new Map();
         this.subscribedTopics = new Set();
+        this.resultsHandler = null;
 
         // Sensor data cache
         this.sensorData = {
@@ -77,6 +78,14 @@ class EnhancedMqttHandler {
         );
 
         this.cameraMonitoringHandler = new CameraMonitoringHandler(
+            this.io,
+            this.sensorData,
+            this.activeUsers,
+            this.sensorDataMutex
+        );
+
+        const ResultsHandler = require('./Actuators/ResultsHandler');
+        this.resultsHandler = new ResultsHandler(
             this.io,
             this.sensorData,
             this.activeUsers,
@@ -166,7 +175,8 @@ class EnhancedMqttHandler {
             'bowlT',    // bowl_fan_status
             'sonarT',   // sonar_pump_status
             'CO2T',     // co2_fermentation_status
-            'sugarT'    // sugar_fermentation_status
+            'sugarT',    // sugar_fermentation_status
+            'ESP_S_10'
         ];
 
         for (const topic of legacySensorTopics) {
@@ -331,7 +341,7 @@ class EnhancedMqttHandler {
 
     // ✅ CRITICAL FIX: New method to identify actuator topics
     isActuatorTopic(topic) {
-        const actuatorTopics = ['bowlT', 'sonarT', 'CO2T', 'sugarT'];
+        const actuatorTopics = ['bowlT', 'sonarT', 'CO2T', 'sugarT', 'ESP_S_10'];
         return actuatorTopics.includes(topic);
     }
 
@@ -353,6 +363,10 @@ class EnhancedMqttHandler {
                 case 'sugarT':
                     await this.sugarFermentationHandler.handleSugarFermentationData(topic, payload);
                     break;
+                case 'ESP_S_10':
+                    await this.resultsHandler.handleResultsData(topic, payload);
+                    break;
+
                 default:
                     console.warn(`⚠️ Unknown actuator topic: ${topic}`);
             }
@@ -622,6 +636,11 @@ class EnhancedMqttHandler {
             'sugar_fermentation_status': {
                 'COMPLETE': '✅ Fermentation complete',
                 'CLOSED': '❌ Fermentation closed'
+            },
+            'results': {
+                'COMPLETE': '✅ Fermentation Complete',
+                'ONGOING': '🔄 Fermentation Ongoing',
+                'OFF': '❌ Fermentation OFF'
             }
         };
 
