@@ -10,6 +10,7 @@ const cameraRoutes = require("./cameraRoutes");
 const environmentRoutes = require("./environmentRoutes");
 const sensorRoutes = require("./sensorRoutes");
 const actuatorRouter = require("./actuatorRoutes");
+const fanSpeedRoutes = require("./fanSpeedRoutes");
 
 const setupRoutes = (app) => {
     app.use("/api", authRoutes);
@@ -24,6 +25,7 @@ const setupRoutes = (app) => {
     app.use("/api/environment", environmentRoutes);
     app.use("/api/sensors", sensorRoutes);
     app.use('/api/actuators', actuatorRouter);
+    app.use("/api/fan-speed", fanSpeedRoutes);
 
 
     // Health check endpoint

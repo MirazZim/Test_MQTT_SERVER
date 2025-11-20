@@ -104,6 +104,225 @@ const createSocketIOServer = (server) => {
             }
         });
 
+
+
+        // ============================================
+        // FAN SPEED CONTROL HANDLER (Socket.IO)
+        // ============================================
+        socket.on('setFanSpeed', async (data) => {
+            console.log(`\n🌀 [Socket.IO] setFanSpeed event received from ${username}`);
+            console.log(`🌀 Data:`, data);
+
+            const { roomCode, speed } = data;
+
+            // Validate input
+            if (!roomCode) {
+                socket.emit('fanSpeedError', {
+                    message: 'Room code is required',
+                    timestamp: new Date().toISOString()
+                });
+                return;
+            }
+
+            if (speed === undefined || speed === null) {
+                socket.emit('fanSpeedError', {
+                    message: 'Speed value is required',
+                    timestamp: new Date().toISOString()
+                });
+                return;
+            }
+
+            const speedValue = parseInt(speed);
+            if (isNaN(speedValue) || speedValue < 0 || speedValue > 100) {
+                socket.emit('fanSpeedError', {
+                    message: 'Speed must be between 0 and 100',
+                    timestamp: new Date().toISOString()
+                });
+                return;
+            }
+
+            // ✅ FIX #4: Use database transaction
+            const connection = await pool.getConnection();
+
+            try {
+                await connection.beginTransaction();
+
+                // Get room details
+                const [roomRows] = await connection.execute(
+                    'SELECT id FROM rooms WHERE room_code = ? AND user_id = ? LIMIT 1',
+                    [roomCode, userId]
+                );
+
+                if (roomRows.length === 0) {
+                    socket.emit('fanSpeedError', {
+                        message: 'Room not found or access denied',
+                        timestamp: new Date().toISOString()
+                    });
+                    await connection.rollback();
+                    return;
+                }
+
+                const roomId = roomRows[0].id;
+
+                // Get fan speed actuator
+                const [actuatorRows] = await connection.execute(
+                    `SELECT id, actuator_name, mqtt_topic, current_state 
+                     FROM actuators 
+                     WHERE room_id = ? 
+                     AND actuator_type_id = (SELECT id FROM actuator_types WHERE type_code = 'fan_speed_control')
+                     AND is_active = 1
+                     LIMIT 1`,
+                    [roomId]
+                );
+
+                if (actuatorRows.length === 0) {
+                    socket.emit('fanSpeedError', {
+                        message: 'Fan speed controller not found in this room',
+                        timestamp: new Date().toISOString()
+                    });
+                    await connection.rollback();
+                    return;
+                }
+
+                const actuator = actuatorRows[0];
+                const actuatorId = actuator.id;
+                const actuatorName = actuator.actuator_name;
+                const mqttTopic = actuator.mqtt_topic;
+                const oldSpeed = actuator.current_state || '0';
+
+                console.log(`✅ Found actuator: ${actuatorName} (ID: ${actuatorId})`);
+                console.log(`📊 Old Speed: ${oldSpeed}%, New Speed: ${speedValue}%`);
+
+                // ✅ FIX #2: Update database FIRST
+
+                // 1. Update actuators table
+                await connection.execute(
+                    'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
+                    [speedValue.toString(), actuatorId]
+                );
+
+                // 2. Log to actuator_control_logs
+                await connection.execute(
+                    `INSERT INTO actuator_control_logs 
+                     (actuator_id, command_value, command_source, user_id, executed_at) 
+                     VALUES (?, ?, 'manual', ?, NOW())`,
+                    [actuatorId, speedValue, userId]
+                );
+
+                // 3. Update actuator_states
+                const [existingState] = await connection.execute(
+                    `SELECT id FROM actuator_states 
+                     WHERE user_id = ? AND room_id = ? AND actuator_type = ?
+                     LIMIT 1`,
+                    [userId, roomId, actuatorName]
+                );
+
+                if (existingState.length > 0) {
+                    await connection.execute(
+                        `UPDATE actuator_states 
+                         SET status = ?, message = ?, state = 1, timestamp = NOW()
+                         WHERE id = ?`,
+                        [`${speedValue}%`, `Fan speed set to ${speedValue}%`, existingState[0].id]
+                    );
+                } else {
+                    await connection.execute(
+                        `INSERT INTO actuator_states 
+                         (user_id, room_id, actuator_type, status, message, state, timestamp)
+                         VALUES (?, ?, ?, ?, ?, 1, NOW())`,
+                        [userId, roomId, actuatorName, `${speedValue}%`, `Fan speed set to ${speedValue}%`]
+                    );
+                }
+
+                // 4. Log to user_audit_log (only if state changed)
+                if (oldSpeed !== speedValue.toString()) {
+                    await connection.execute(
+                        `INSERT INTO user_audit_log 
+                         (user_id, room_id, action_type, action_description, entity_type, entity_id, old_value, new_value, created_at)
+                         VALUES (?, ?, 'fan_speed_change', ?, 'actuator', ?, ?, ?, NOW())`,
+                        [
+                            userId,
+                            roomId,
+                            `${username} changed fan speed in ${roomCode} from ${oldSpeed}% to ${speedValue}%`,
+                            actuatorId,
+                            oldSpeed,
+                            speedValue.toString()
+                        ]
+                    );
+                    console.log(`✅ Audit log created`);
+                }
+
+                // Commit transaction
+                await connection.commit();
+                console.log(`✅ Transaction committed`);
+
+                // ✅ FIX #5: Improved MQTT error handling
+                if (mqttHandler && mqttTopic) {
+                    try {
+                        const published = mqttHandler.publishToTopic(mqttTopic, speedValue.toString());
+                        if (published) {
+                            console.log(`✅ Published to MQTT topic: ${mqttTopic}`);
+                        } else {
+                            console.warn(`⚠️ MQTT publish returned false for topic: ${mqttTopic}`);
+                        }
+                    } catch (mqttError) {
+                        console.error(`❌ MQTT publish error:`, mqttError);
+                        // Don't fail the entire operation, just log the error
+                    }
+                } else {
+                    console.warn(`⚠️ MQTT handler unavailable or no topic configured`);
+                }
+
+                // Emit success to requesting socket
+                socket.emit('fanSpeedSuccess', {
+                    roomCode,
+                    actuatorId,
+                    actuatorName,
+                    oldSpeed: parseInt(oldSpeed),
+                    newSpeed: speedValue,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Broadcast to all users in the room
+                io.to(`room_${roomCode}`).emit('fanSpeedUpdated', {
+                    roomCode,
+                    actuatorId,
+                    actuatorName,
+                    oldSpeed: parseInt(oldSpeed),
+                    newSpeed: speedValue,
+                    updatedBy: username,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Notify admins
+                io.to('admin_room').emit('adminAuditLog', {
+                    type: 'fan_speed_change',
+                    user: username,
+                    userId,
+                    roomCode,
+                    roomId,
+                    actuatorName,
+                    oldValue: oldSpeed,
+                    newValue: speedValue.toString(),
+                    timestamp: new Date().toISOString()
+                });
+
+                console.log(`✅ Fan speed control completed successfully\n`);
+
+            } catch (error) {
+                await connection.rollback();
+                console.error(`❌ [Socket.IO setFanSpeed] Error:`, error);
+
+                socket.emit('fanSpeedError', {
+                    message: 'Failed to set fan speed. Please try again.',
+                    error: error.message,
+                    timestamp: new Date().toISOString()
+                });
+            } finally {
+                connection.release();
+            }
+        });
+
+
         socket.on('sendActuatorCommand', (data) => {
             const { userId, location, command } = data;
             console.log(`🎛️ Actuator command: ${command} for user ${userId} in ${location}`);

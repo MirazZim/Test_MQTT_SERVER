@@ -11,15 +11,18 @@ console.log("🔵 [Temperature Control Routes] Initializing routes");
 // ============================================
 // AUDIT LOGGER HELPER FUNCTION
 // ============================================
-const logUserAction = async (userId, actionType, actionDescription, oldValue, newValue, roomId = null, ipAddress = 'Unknown', userAgent = 'Unknown') => {
+const logUserAction = async (
+    userId,
+    actionType,
+    actionDescription,
+    oldValue,
+    newValue,
+    roomId = null,
+    ipAddress = 'Unknown',
+    userAgent = 'Unknown'
+) => {
     try {
-        console.log(`🔵 [Audit] Logging action: ${actionDescription} for user ${userId}`);
-
-        await pool.execute(`
-      INSERT INTO user_audit_log
-      (user_id, room_id, action_type, action_description, old_value, new_value, entity_type, entity_id, ip_address, user_agent, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NOW())
-    `, [
+        console.log(`📝 [Audit] Attempting to log:`, {
             userId,
             roomId,
             actionType,
@@ -28,63 +31,67 @@ const logUserAction = async (userId, actionType, actionDescription, oldValue, ne
             newValue,
             ipAddress,
             userAgent
-        ]);
+        });
 
-        console.log(`✅ [Audit] Logged: User ${userId} - ${actionDescription} (${oldValue} → ${newValue})`);
+        const [result] = await pool.execute(
+            `INSERT INTO userauditlog 
+            (userid, roomid, actiontype, actiondescription, oldvalue, newvalue, entitytype, entityid, ipaddress, useragent, createdat)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NOW())`,
+            [userId, roomId, actionType, actionDescription, oldValue, newValue, ipAddress, userAgent]
+        );
+
+        console.log(`✅ [Audit] Successfully logged. Insert ID: ${result.insertId}`);
 
         // Emit real-time update to admin dashboard
         if (global.io) {
-            global.io.to('admin_dashboard').emit('userActionAudit', {
-                id: Date.now(),
-                user_id: userId,
-                action_type: actionType,
-                action_description: actionDescription,
-                old_value: oldValue,
-                new_value: newValue,
-                room_id: roomId,
-                created_at: new Date().toISOString()
+            global.io.to('admin-dashboard').emit('userActionAudit', {
+                id: result.insertId,
+                userid: userId,
+                actiontype: actionType,
+                actiondescription: actionDescription,
+                oldvalue: oldValue,
+                newvalue: newValue,
+                roomid: roomId,
+                createdat: new Date().toISOString()
             });
+            console.log(`📡 [Audit] Emitted to admin dashboard`);
         }
 
         return true;
     } catch (error) {
-        console.error('❌ [Audit] Error logging user action:', error.message);
+        console.error(`❌ [Audit] FAILED to log user action:`);
+        console.error(`   - Error Message: ${error.message}`);
+        console.error(`   - Error Code: ${error.code}`);
+        console.error(`   - SQL State: ${error.sqlState}`);
+        console.error(`   - SQL Message: ${error.sqlMessage}`);
+        console.error(`   - Parameters:`, { userId, roomId, actionType, actionDescription, oldValue, newValue });
         return false;
     }
 };
 
 // ============================================
-// POST /setpoint - Set desired temperature
+// 📡 POST /setpoint - Set desired temperature OR fan speed
 // ============================================
 temperatureControlRouter.post("/setpoint", adminOrUser, async (req, res) => {
     console.log(`🔵 [Route POST /setpoint] User: ${req.user.id}`);
 
     try {
-        const { targetTemperature } = req.body;
+        const {
+            targetTemperature,
+            targetHumidity,
+            targetAirflow,
+            fanSpeed,      // ✅ NEW
+            actuatorId,    // ✅ NEW
+            oldValue,      // ✅ NEW
+            newValue       // ✅ NEW
+        } = req.body;
+
         const location = req.query.location || req.body.location || 'sensor-room';
         const userId = req.user.id;
 
-        console.log(`🔵 [Route] Setting temperature for location: ${location}`);
+        console.log(`🔵 [Route] Request body:`, req.body);
 
-        // Validate input
-        if (targetTemperature === undefined || targetTemperature === null) {
-            console.warn(`⚠️ [Route] Missing target temperature`);
-            return res.status(400).json({
-                status: "failed",
-                message: "Target temperature is required"
-            });
-        }
-
-        const temp = parseFloat(targetTemperature);
-        if (isNaN(temp) || temp < -10 || temp > 50) {
-            console.warn(`⚠️ [Route] Invalid temperature: ${temp}`);
-            return res.status(400).json({
-                status: "failed",
-                message: "Target temperature must be a number between -10°C and 50°C"
-            });
-        }
-
-        // Get room_id
+        // Get room_id first
         const [roomRows] = await pool.execute(
             'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
             [userId, location]
@@ -101,70 +108,323 @@ temperatureControlRouter.post("/setpoint", adminOrUser, async (req, res) => {
         const roomId = roomRows[0].id;
         console.log(`✅ [Route] Found room_id: ${roomId}`);
 
-        // Get old value for audit trail
-        const [settingRows] = await pool.execute(
-            'SELECT target_temperature FROM room_control_settings WHERE room_id = ?',
-            [roomId]
-        );
+        // ============================================
+        // ✅ HANDLE FAN SPEED CHANGE (IMPROVED)
+        // ============================================
+        if (fanSpeed !== undefined && actuatorId) {
+            console.log(`🌀 [Route] Handling fan speed change: ${oldValue} → ${fanSpeed} (Actuator ID: ${actuatorId})`);
 
-        let oldTemperature = null;
+            try {
+                // Step 1: Verify actuator exists and belongs to user
+                const [actuatorRows] = await pool.execute(
+                    `SELECT a.id, a.mqtt_topic, a.actuator_name, a.current_state, r.id as room_id
+                     FROM actuators a
+                     INNER JOIN rooms r ON a.room_id = r.id
+                     WHERE a.id = ? AND r.user_id = ? AND a.is_active = 1`,
+                    [actuatorId, userId]
+                );
 
-        if (settingRows.length > 0) {
-            // Update existing setting
-            oldTemperature = settingRows[0].target_temperature;
-            await pool.execute(
-                'UPDATE room_control_settings SET target_temperature = ?, updated_at = NOW() WHERE room_id = ?',
-                [temp, roomId]
-            );
-            console.log(`✅ [Route] Updated temperature: ${oldTemperature} → ${temp}`);
-        } else {
-            // Insert new setting
-            await pool.execute(
-                'INSERT INTO room_control_settings (room_id, target_temperature, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
-                [roomId, temp]
-            );
-            console.log(`✅ [Route] Created new temperature setting: ${temp}`);
-        }
+                if (actuatorRows.length === 0) {
+                    console.error(`❌ [Route] Actuator ${actuatorId} not found or unauthorized`);
+                    return res.status(404).json({
+                        status: "failed",
+                        message: "Actuator not found or unauthorized"
+                    });
+                }
 
-        // Log to audit trail
-        await logUserAction(
-            userId,
-            'TEMPERATURE_SET',
-            'Temperature Setpoint Changed',
-            oldTemperature,
-            temp,
-            roomId,
-            req.ip || 'Unknown',
-            req.headers['user-agent'] || 'Unknown'
-        );
+                const actuator = actuatorRows[0];
+                const actuatorRoomId = actuator.room_id;
+                console.log(`✅ [Route] Actuator verified: ${actuator.actuator_name} in room ${actuatorRoomId}`);
 
-        // Publish to MQTT
-        const { mqttClient } = require("../server");
-        if (mqttClient && mqttClient.publishSimple) {
-            const topic = `${userId}/${location}/control/setpoint`;
-            mqttClient.publishSimple(topic, temp.toString());
-            console.log(`📡 [Route] Published to MQTT: ${topic} = ${temp}`);
-        }
+                // Step 2: Update actuator current_state
+                const [updateResult] = await pool.execute(
+                    'UPDATE actuators SET current_state = ?, target_state = ?, last_command_at = NOW() WHERE id = ?',
+                    [fanSpeed.toString(), fanSpeed.toString(), actuatorId]
+                );
 
-        // Response
-        res.status(200).json({
-            status: "success",
-            message: "Target temperature set successfully",
-            data: {
-                userId,
-                roomId,
-                location,
-                targetTemperature: temp,
-                auditLogged: true
+                console.log(`✅ [Route] Updated actuator ${actuatorId} to ${fanSpeed}% (${updateResult.affectedRows} rows affected)`);
+
+                // Step 3: Log to actuator_control_logs
+                const [logResult] = await pool.execute(
+                    `INSERT INTO actuator_control_logs 
+                    (actuator_id, command_value, command_source, executed_at, success) 
+                    VALUES (?, ?, 'manual', NOW(), 1)`,
+                    [actuatorId, fanSpeed]
+                );
+
+                console.log(`✅ [Route] Logged to actuator_control_logs (ID: ${logResult.insertId})`);
+
+                // Step 4: Log to audit trail WITH ERROR CHECKING
+                const auditLogged = await logUserAction(
+                    userId,
+                    'FAN_SPEED_SET',
+                    `Fan Speed Changed from ${oldValue || 'N/A'}% to ${fanSpeed}%`,
+                    oldValue?.toString() || null,
+                    fanSpeed.toString(),
+                    actuatorRoomId,  // Use the room ID from actuator query
+                    req.ip || req.connection?.remoteAddress || '127.0.0.1',
+                    req.headers['user-agent'] || 'Unknown'
+                );
+
+                if (!auditLogged) {
+                    console.error(`❌ [Route] CRITICAL: Audit trail failed for fan speed change!`);
+                } else {
+                    console.log(`✅ [Route] Audit logged successfully for fan speed change`);
+                }
+
+                // Step 5: Publish to MQTT
+                if (actuator.mqtt_topic) {
+                    const mqttTopic = actuator.mqtt_topic;
+
+                    // Try to get mqttClient from server or global
+                    const { mqttClient } = require("../server");
+                    if (mqttClient && mqttClient.publishSimple) {
+                        mqttClient.publishSimple(mqttTopic, fanSpeed.toString());
+                        console.log(`📡 [Route] Published to MQTT: ${mqttTopic} = ${fanSpeed}`);
+                    } else if (global.mqttHandler && global.mqttHandler.mqttClient) {
+                        global.mqttHandler.mqttClient.publish(
+                            mqttTopic,
+                            fanSpeed.toString(),
+                            { qos: 1 },
+                            (err) => {
+                                if (err) {
+                                    console.error(`❌ [Route] MQTT publish error:`, err);
+                                } else {
+                                    console.log(`📡 [Route] Published to MQTT: ${mqttTopic} = ${fanSpeed}`);
+                                }
+                            }
+                        );
+                    } else {
+                        console.warn(`⚠️ [Route] MQTT client not available`);
+                    }
+                }
+
+                // Step 6: Emit real-time update via Socket.IO
+                if (global.io) {
+                    global.io.to(`user_${userId}_${location}`).emit('actuatorUpdate', {
+                        actuatorType: 'fan_speed_control',
+                        value: fanSpeed,
+                        state: fanSpeed > 0 ? 'ON' : 'OFF',
+                        roomCode: location,
+                        roomId: actuatorRoomId,
+                        timestamp: new Date().toISOString()
+                    });
+                    console.log(`📡 [Route] Emitted actuatorUpdate via Socket.IO`);
+                }
+
+                // Step 7: Return success response
+                return res.status(200).json({
+                    status: "success",
+                    message: "Fan speed set successfully",
+                    data: {
+                        userId,
+                        roomId: actuatorRoomId,
+                        location,
+                        fanSpeed: fanSpeed,
+                        actuatorId,
+                        actuatorName: actuator.actuator_name,
+                        auditLogged: auditLogged  // ✅ Include audit status
+                    }
+                });
+
+            } catch (fanError) {
+                console.error(`❌ [Route] Error in fan speed handler:`, fanError);
+                return res.status(500).json({
+                    status: "failed",
+                    message: "Failed to update fan speed",
+                    error: fanError.message
+                });
             }
+        }
+
+        // ============================================
+        // ✅ HANDLE TEMPERATURE CHANGE (existing code)
+        // ============================================
+        if (targetTemperature !== undefined) {
+            const temp = parseFloat(targetTemperature);
+
+            // Validate input
+            if (isNaN(temp) || temp < -10 || temp > 50) {
+                console.warn(`⚠️ [Route] Invalid temperature: ${temp}`);
+                return res.status(400).json({
+                    status: "failed",
+                    message: "Target temperature must be a number between -10°C and 50°C"
+                });
+            }
+
+            // Get old value for audit trail
+            const [settingRows] = await pool.execute(
+                'SELECT target_temperature FROM room_control_settings WHERE room_id = ?',
+                [roomId]
+            );
+
+            let oldTemperature = null;
+
+            if (settingRows.length > 0) {
+                oldTemperature = settingRows[0].target_temperature;
+                await pool.execute(
+                    'UPDATE room_control_settings SET target_temperature = ?, updated_at = NOW() WHERE room_id = ?',
+                    [temp, roomId]
+                );
+                console.log(`✅ [Route] Updated temperature: ${oldTemperature} → ${temp}`);
+            } else {
+                await pool.execute(
+                    'INSERT INTO room_control_settings (room_id, target_temperature, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
+                    [roomId, temp]
+                );
+                console.log(`✅ [Route] Created new temperature setting: ${temp}`);
+            }
+
+            // Log to audit trail
+            const auditLogged = await logUserAction(
+                userId,
+                'TEMPERATURE_SET',
+                `Temperature Setpoint Changed from ${oldTemperature}°C to ${temp}°C`,
+                oldTemperature,
+                temp,
+                roomId,
+                req.ip || req.connection?.remoteAddress || '127.0.0.1',
+                req.headers['user-agent'] || 'Unknown'
+            );
+
+            if (!auditLogged) {
+                console.error(`❌ [Route] Audit trail failed for temperature change`);
+            }
+
+            // Publish to MQTT
+            const { mqttClient } = require("../server");
+            if (mqttClient && mqttClient.publishSimple) {
+                const topic = `${userId}/${location}/control/setpoint`;
+                mqttClient.publishSimple(topic, temp.toString());
+                console.log(`📡 [Route] Published to MQTT: ${topic} = ${temp}`);
+            }
+
+            return res.status(200).json({
+                status: "success",
+                message: "Target temperature set successfully",
+                data: {
+                    userId,
+                    roomId,
+                    location,
+                    targetTemperature: temp,
+                    auditLogged: auditLogged
+                }
+            });
+        }
+
+        // ============================================
+        // ✅ HANDLE HUMIDITY CHANGE
+        // ============================================
+        if (targetHumidity !== undefined) {
+            const humidity = parseFloat(targetHumidity);
+
+            const [settingRows] = await pool.execute(
+                'SELECT target_humidity FROM room_control_settings WHERE room_id = ?',
+                [roomId]
+            );
+
+            let oldHumidity = null;
+
+            if (settingRows.length > 0) {
+                oldHumidity = settingRows[0].target_humidity;
+                await pool.execute(
+                    'UPDATE room_control_settings SET target_humidity = ?, updated_at = NOW() WHERE room_id = ?',
+                    [humidity, roomId]
+                );
+            } else {
+                await pool.execute(
+                    'INSERT INTO room_control_settings (room_id, target_humidity, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
+                    [roomId, humidity]
+                );
+            }
+
+            const auditLogged = await logUserAction(
+                userId,
+                'HUMIDITY_SET',
+                `Humidity Setpoint Changed from ${oldHumidity}% to ${humidity}%`,
+                oldHumidity,
+                humidity,
+                roomId,
+                req.ip || req.connection?.remoteAddress || '127.0.0.1',
+                req.headers['user-agent'] || 'Unknown'
+            );
+
+            return res.status(200).json({
+                status: "success",
+                message: "Target humidity set successfully",
+                data: {
+                    userId,
+                    roomId,
+                    location,
+                    targetHumidity: humidity,
+                    auditLogged: auditLogged
+                }
+            });
+        }
+
+        // ============================================
+        // ✅ HANDLE AIRFLOW CHANGE
+        // ============================================
+        if (targetAirflow !== undefined) {
+            const airflow = parseFloat(targetAirflow);
+
+            const [settingRows] = await pool.execute(
+                'SELECT target_airflow FROM room_control_settings WHERE room_id = ?',
+                [roomId]
+            );
+
+            let oldAirflow = null;
+
+            if (settingRows.length > 0) {
+                oldAirflow = settingRows[0].target_airflow;
+                await pool.execute(
+                    'UPDATE room_control_settings SET target_airflow = ?, updated_at = NOW() WHERE room_id = ?',
+                    [airflow, roomId]
+                );
+            } else {
+                await pool.execute(
+                    'INSERT INTO room_control_settings (room_id, target_airflow, created_at, updated_at) VALUES (?, ?, NOW(), NOW())',
+                    [roomId, airflow]
+                );
+            }
+
+            const auditLogged = await logUserAction(
+                userId,
+                'AIRFLOW_SET',
+                `Airflow Setpoint Changed from ${oldAirflow} to ${airflow}`,
+                oldAirflow,
+                airflow,
+                roomId,
+                req.ip || req.connection?.remoteAddress || '127.0.0.1',
+                req.headers['user-agent'] || 'Unknown'
+            );
+
+            return res.status(200).json({
+                status: "success",
+                message: "Target airflow set successfully",
+                data: {
+                    userId,
+                    roomId,
+                    location,
+                    targetAirflow: airflow,
+                    auditLogged: auditLogged
+                }
+            });
+        }
+
+        // If nothing was provided
+        return res.status(400).json({
+            status: "failed",
+            message: "No valid setpoint parameters provided"
         });
-        console.log(`✅ [Route POST /setpoint] Success`);
 
     } catch (error) {
         console.error("❌ [Route POST /setpoint] Error:", error.message);
+        console.error("Stack:", error.stack);
         res.status(500).json({
             status: "failed",
-            message: "Internal server error"
+            message: "Internal server error",
+            error: error.message
         });
     }
 });

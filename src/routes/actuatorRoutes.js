@@ -1,34 +1,43 @@
-// routes/actuatorRoutes.js (create new file or add to existing routes)
+// routes/actuatorRoutes.js
 const express = require('express');
 const { adminOrUser } = require('../middleware/auth');
 const pool = require('../config/db');
 
 const actuatorRouter = express.Router();
 
-// ✅ Get all actuators for a room
-actuatorRouter.get('/room-actuators', adminOrUser, async (req, res) => {
-    console.log(`🔵 [Route GET /room-actuators] User: ${req.user.id}`);
+// ✅ Changed from '/room-actuators' to '/' to match frontend
+actuatorRouter.get('/', adminOrUser, async (req, res) => {
+    console.log(`🔵 [Route GET /api/actuators] User: ${req.user.id}`);
 
     try {
-        const location = req.query.location || 'sensor-room';
+        const roomCode = req.query.roomCode;
         const userId = req.user.id;
+
+        if (!roomCode) {
+            return res.status(400).json({
+                status: "failed",
+                message: "roomCode parameter is required"
+            });
+        }
+
+        console.log(`🔍 [Route] Fetching actuators for room: ${roomCode}`);
 
         // Get room_id
         const [roomRows] = await pool.execute(
             'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
-            [userId, location]
+            [userId, roomCode]
         );
 
         if (roomRows.length === 0) {
             return res.status(404).json({
                 status: "failed",
-                message: `Room not found for location: ${location}`
+                message: `Room '${roomCode}' not found or access denied`
             });
         }
 
         const roomId = roomRows[0].id;
 
-        // Get all actuators for this room
+        // Get all actuators with type information
         const [actuators] = await pool.execute(
             `SELECT 
                 a.id,
@@ -37,9 +46,10 @@ actuatorRouter.get('/room-actuators', adminOrUser, async (req, res) => {
                 a.mqtt_topic,
                 a.current_state,
                 a.is_active,
+                a.updated_at,
                 at.id as type_id,
-                at.type_code,
-                at.type_name,
+                at.type_code as actuator_type_code,
+                at.type_name as actuator_type_name,
                 at.control_type,
                 at.category
             FROM actuators a
@@ -49,23 +59,20 @@ actuatorRouter.get('/room-actuators', adminOrUser, async (req, res) => {
             [roomId]
         );
 
-        console.log(`✅ [Route] Retrieved ${actuators.length} actuators for room ${location}`);
+        console.log(`✅ [Route] Retrieved ${actuators.length} actuators for room ${roomCode}`);
 
         res.status(200).json({
             status: "success",
             message: "Actuators retrieved successfully",
-            data: {
-                roomId,
-                location,
-                actuators
-            }
+            actuators: actuators  // ✅ Return directly in response root for frontend compatibility
         });
 
     } catch (error) {
-        console.error("❌ [Route GET /room-actuators] Error:", error.message);
+        console.error("❌ [Route GET /api/actuators] Error:", error);
+
         res.status(500).json({
             status: "failed",
-            message: "Internal server error"
+            message: "Failed to retrieve actuators"
         });
     }
 });
