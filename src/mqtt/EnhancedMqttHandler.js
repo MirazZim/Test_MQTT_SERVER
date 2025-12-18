@@ -177,7 +177,7 @@ class EnhancedMqttHandler {
     async subscribeLegacyTopics(client) {
         const legacySensorTopics = [
             'ESP', 'ESP2', 'bowl', 'sonar',
-            'CO2', 'sugar', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
+            'CO2', 'co2', 'sugar', 'ESP3', 'ESPX', 'ESPX2', 'ESPX3'
         ];
 
         const legacyActuatorTopics = [
@@ -411,6 +411,7 @@ class EnhancedMqttHandler {
             'bowl': 'bowl_temp',
             'sonar': 'sonar_distance',
             'CO2': 'co2_level',
+            'co2': 'co2_level',
             'sugar': 'sugar_level',
             'ESP3': 'airflow',
             'ESPX': 'temperature',

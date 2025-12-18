@@ -1,7 +1,7 @@
-const BaseSensorHandler3 = require('../base/BaseSensorHandler');
-const pool3 = require('../../config/db');
+const BaseSensorHandler4 = require('../base/BaseSensorHandler');
+const pool4 = require('../../config/db');
 
-class SonarDistanceHandler extends BaseSensorHandler3 {
+class SonarDistanceHandler extends BaseSensorHandler4 {
     constructor(io, sensorData, activeUsers, sensorDataMutex) {
         super(io, sensorData, activeUsers, sensorDataMutex);
         console.log(`🔵 [SonarDistanceHandler] Initialized`);
@@ -19,9 +19,9 @@ class SonarDistanceHandler extends BaseSensorHandler3 {
         console.log(`📏 Distance: ${value.toFixed(2)} cm`);
         this.updateCache('sonar_distance', value);
 
-        // ✅ FIX: Emit sensorData for chart updates
+        // ✅ Emit sensorData for chart updates
         try {
-            const [sensors] = await pool3.execute(
+            const [sensors] = await pool4.execute(
                 'SELECT id, user_id FROM sensors WHERE mqtt_topic = ? AND is_active = 1',
                 [topic]
             );
@@ -69,7 +69,7 @@ class SonarDistanceHandler extends BaseSensorHandler3 {
         try {
             console.log(`🔵 [SonarDistanceHandler] Saving - User: ${userId}, Room: ${roomCode}`);
 
-            const [rooms] = await pool3.execute(
+            const [rooms] = await pool4.execute(
                 'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
                 [userId, roomCode]
             );
@@ -82,14 +82,14 @@ class SonarDistanceHandler extends BaseSensorHandler3 {
             const roomId = rooms[0].id;
             console.log(`✅ [SonarDistanceHandler] Found room_id: ${roomId}`);
 
-            const [sensors] = await pool3.execute(
+            const [sensors] = await pool4.execute(
                 `SELECT s.id FROM sensors s
-         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-         WHERE s.user_id = ? 
-         AND s.room_id = ? 
-         AND st.type_code = 'sonar_distance'
-         AND s.is_active = 1
-         LIMIT 1`,
+                 INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+                 WHERE s.user_id = ? 
+                 AND s.room_id = ? 
+                 AND st.type_code = 'sonar_distance'
+                 AND s.is_active = 1
+                 LIMIT 1`,
                 [userId, roomId]
             );
 
@@ -101,12 +101,12 @@ class SonarDistanceHandler extends BaseSensorHandler3 {
             const sensorId = sensors[0].id;
             console.log(`✅ [SonarDistanceHandler] Found sensor_id: ${sensorId}`);
 
-            await pool3.execute(
+            await pool4.execute(
                 'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
                 [sensorId, value]
             );
 
-            await pool3.execute(
+            await pool4.execute(
                 'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
                 [sensorId]
             );
