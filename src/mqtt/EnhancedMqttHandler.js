@@ -405,6 +405,12 @@ class EnhancedMqttHandler {
     async handleLegacyTopic(topic, payload) {
         console.log(`📜 [Legacy] Handling legacy topic: ${topic}`);
 
+        // ✅ ADD THIS DEBUG
+        if (topic === 'CO2') {
+            console.log('🔍 [DEBUG] CO2 message received!');
+            console.log('🔍 [DEBUG] Payload:', payload);
+        }
+
         const legacyMapping = {
             'ESP2': 'temperature',
             'ESP': 'humidity',
@@ -425,22 +431,42 @@ class EnhancedMqttHandler {
             return;
         }
 
+        // ✅ ADD THIS DEBUG
+        if (topic === 'CO2') {
+            console.log('🔍 [DEBUG] Looking for sensor type:', sensorType);
+        }
+
         const [sensors] = await pool.execute(
             `SELECT s.*, st.type_code, st.type_name, st.unit, r.room_code, r.room_name, r.id as room_id
-             FROM sensors s
-             INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-             LEFT JOIN rooms r ON s.room_id = r.id
-             WHERE (s.mqtt_topic = ? OR st.type_code = ?) AND s.is_active = 1
-             LIMIT 1`,
+         FROM sensors s
+         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+         LEFT JOIN rooms r ON s.room_id = r.id
+         WHERE (s.mqtt_topic = ? OR st.type_code = ?) AND s.is_active = 1
+         LIMIT 1`,
             [topic, sensorType]
         );
+
+        // ✅ ADD THIS DEBUG
+        if (topic === 'CO2') {
+            console.log('🔍 [DEBUG] Sensors found:', sensors.length);
+            if (sensors.length > 0) {
+                console.log('🔍 [DEBUG] Sensor details:', sensors[0]);
+            }
+        }
 
         if (sensors.length > 0) {
             await this.handleSensorMessage(sensors[0], payload);
         } else {
             console.warn(`⚠️ No sensor found for legacy topic: ${topic}`);
+            // ✅ ADD THIS
+            if (topic === 'CO2') {
+                console.error('❌ CO2 SENSOR NOT FOUND IN DATABASE!');
+                console.error('   Run this SQL to check:');
+                console.error('   SELECT * FROM sensors WHERE mqtt_topic = "CO2" OR type_code = "co2_level";');
+            }
         }
     }
+
 
     async handleDynamicMessage(topic, payload) {
         try {
