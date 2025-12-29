@@ -483,9 +483,14 @@ class EnhancedMqttHandler {
             );
 
             if (sensors.length > 0) {
+                console.log(`✅ Found sensor for topic ${topic}:`, sensors[0].sensor_name);
                 await this.handleSensorMessage(sensors[0], payload);
                 return;
             }
+
+            // ✅ ADD LOGGING HERE
+            console.warn(`⚠️ No sensor found for topic: ${topic}`);
+            console.warn(`   Checking actuators...`);
 
             // ✅ OPTIMIZED: Include control_type in query
             const [actuators] = await pool.execute(
@@ -500,11 +505,14 @@ class EnhancedMqttHandler {
             );
 
             if (actuators.length > 0) {
+                console.log(`✅ Found actuator for topic ${topic}:`, actuators[0].actuator_name);
                 await this.handleActuatorMessage(actuators[0], payload);
                 return;
             }
 
-            console.warn(`⚠️ No sensor or actuator found for topic: ${topic}`);
+            console.error(`❌ [CRITICAL] No sensor or actuator found for topic: ${topic}`);
+            console.error(`   Make sure your device is registered in the database`);
+
         } catch (error) {
             console.error(`❌ Error handling message:`, error.message);
         }
@@ -533,10 +541,12 @@ class EnhancedMqttHandler {
                 }
             }
 
+            // ✅ UPDATE CACHE
             if (this.sensorData.hasOwnProperty(sensor.type_code)) {
                 this.sensorData[sensor.type_code] = value;
             }
 
+            // ✅ SAVE TO DATABASE
             await pool.execute(
                 `INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator)
                  VALUES (?, ?, NOW(3), 100)`,
@@ -553,7 +563,15 @@ class EnhancedMqttHandler {
             const timestamp = new Date().toISOString();
             const roomCode = sensor.room_code || sensor.room_name || 'unknown';
 
-            this.io.to(`user_${sensor.user_id}_${roomCode}`).emit('sensorUpdate', {
+            // ✅ CRITICAL FIX: Emit to correct rooms
+            console.log(`📡 Emitting to rooms:`, {
+                user_room: `user_${sensor.user_id}_${roomCode}`,
+                location_room: `location_${roomCode}`,
+                sensor_room: `sensor_${sensor.id}`
+            });
+
+            // Emit to all connected clients
+            const sensorData = {
                 sensorId: sensor.id,
                 sensorType: sensor.type_code,
                 sensorName: sensor.sensor_name,
@@ -565,17 +583,31 @@ class EnhancedMqttHandler {
                 unit: sensor.unit || '',
                 timestamp: timestamp,
                 topic: sensor.mqtt_topic
-            });
+            };
 
+            // ✅ Emit to user-specific room
+            this.io.to(`user_${sensor.user_id}_${roomCode}`).emit('sensorUpdate', sensorData);
+            console.log(`✅ Emitted sensorUpdate to user_${sensor.user_id}_${roomCode}`);
+
+            // ✅ Emit to location room for real-time charts
             this.io.to(`location_${roomCode}`).emit('chartData', {
                 sensorId: sensor.id,
                 sensorType: sensor.type_code,
                 value: value,
+                timestamp: timestamp,
+                unit: sensor.unit || ''
+            });
+            console.log(`✅ Emitted chartData to location_${roomCode}`);
+
+            // ✅ Emit environment update for dashboard
+            this.io.to(`user_${sensor.user_id}_${roomCode}`).emit('environmentUpdate', {
+                [sensor.type_code]: value,
                 timestamp: timestamp
             });
 
         } catch (error) {
             console.error(`❌ Error handling sensor:`, error.message);
+            console.error(error.stack);
         } finally {
             release();
         }
