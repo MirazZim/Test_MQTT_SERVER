@@ -551,6 +551,10 @@ locationRouter.post("/locations/create-room", adminOrUser, async (req, res) => {
                 client.subscribe(topic, { qos: 1 }, (err) => {
                     if (!err) {
                         console.log(`🔌 MQTT: Auto-subscribed to sensor topic: ${topic}`);
+                        // ✅ FIX: Track subscription in EnhancedMqttHandler
+                        if (mqttClient.subscribedTopics) {
+                            mqttClient.subscribedTopics.add(topic);
+                        }
                     } else {
                         console.error(`❌ MQTT: Failed to subscribe to ${topic}:`, err);
                     }
@@ -561,6 +565,10 @@ locationRouter.post("/locations/create-room", adminOrUser, async (req, res) => {
                 client.subscribe(topic, { qos: 1 }, (err) => {
                     if (!err) {
                         console.log(`🔌 MQTT: Auto-subscribed to actuator topic: ${topic}`);
+                        // ✅ FIX: Track subscription in EnhancedMqttHandler
+                        if (mqttClient.subscribedTopics) {
+                            mqttClient.subscribedTopics.add(topic);
+                        }
                     } else {
                         console.error(`❌ MQTT: Failed to subscribe to ${topic}:`, err);
                     }
@@ -753,6 +761,11 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
                         client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
                             if (!err) {
                                 console.log(`🔌 MQTT: Subscribed to new sensor topic: ${newMqttTopic}`);
+                                // ✅ FIX: Track subscription
+                                if (mqttClient.subscribedTopics) {
+                                    mqttClient.subscribedTopics.add(newMqttTopic);
+                                    mqttClient.subscribedTopics.delete(oldTopic);
+                                }
                             } else {
                                 console.error(`❌ MQTT: Failed to subscribe to ${newMqttTopic}:`, err);
                             }
@@ -813,6 +826,11 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
                         client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
                             if (!err) {
                                 console.log(`🔌 MQTT: Subscribed to new actuator topic: ${newMqttTopic}`);
+                                // ✅ FIX: Track subscription
+                                if (mqttClient.subscribedTopics) {
+                                    mqttClient.subscribedTopics.add(newMqttTopic);
+                                    mqttClient.subscribedTopics.delete(oldTopic);
+                                }
                             } else {
                                 console.error(`❌ MQTT: Failed to subscribe to ${newMqttTopic}:`, err);
                             }
@@ -841,6 +859,10 @@ locationRouter.put("/locations/:roomId/update", adminOrUser, async (req, res) =>
                         client.subscribe(newMqttTopic, { qos: 1 }, (err) => {
                             if (!err) {
                                 console.log(`🔌 MQTT: Subscribed to new actuator topic: ${newMqttTopic}`);
+                                // ✅ FIX: Track subscription
+                                if (mqttClient.subscribedTopics) {
+                                    mqttClient.subscribedTopics.add(newMqttTopic);
+                                }
                             } else {
                                 console.error(`❌ MQTT: Failed to subscribe to ${newMqttTopic}:`, err);
                             }

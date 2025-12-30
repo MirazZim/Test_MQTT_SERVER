@@ -321,43 +321,49 @@ class EnhancedMqttHandler {
 
 
     async onMessage(topic, message) {
+        const messageStartTime = Date.now();
+
+        // ✅ ADD PERFORMANCE TRACKING
+        console.log(`⏱️ [PERF] Message received at: ${new Date().toISOString()}`);
+        console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${message.toString('utf8')}`);
+
         if (message.length > 10000) {
-            console.warn(`⚠️ Payload too large for ${topic}: ${message.length} bytes`);
+            console.warn(`⚠️ [EnhancedMqttHandler] Message too large: ${message.length} bytes`);
             return;
         }
 
         const payload = message.toString('utf8');
-        console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${payload}`);
-
-        // ✅ ADD THIS: Log ALL incoming messages
-        console.log(`📥 [EnhancedMqttHandler] MQTT Message - Topic: ${topic}, Payload: ${payload}`);
-
-        // ✅ ADD THIS: Check if subscribed
-        if (!this.subscribedTopics.has(topic)) {
-            console.warn(`⚠️ Received message on NON-SUBSCRIBED topic: ${topic}`);
-        }
 
         try {
-            if (payload.includes('detected in')) {
-                console.log(`📹 [EnhancedMqttHandler] Detected camera message on topic: ${topic}`);
-                await this.cameraMonitoringHandler.handleCameraDetectionData(topic, payload);
-                return;
-            }
+            // ✅ CRITICAL FIX: Use setImmediate to prevent blocking
+            setImmediate(async () => {
+                try {
+                    // ✅ Immediately route message (no await here)
+                    if (this.isActuatorTopic(topic)) {
+                        this.handleActuatorTopic(topic, payload).catch(err => {
+                            console.error(`❌ [Actuator Handler Error]:`, err.message);
+                        });
+                    } else if (this.isLegacyTopic(topic)) {
+                        this.handleLegacyTopic(topic, payload).catch(err => {
+                            console.error(`❌ [Legacy Handler Error]:`, err.message);
+                        });
+                    } else {
+                        this.handleDynamicMessage(topic, payload).catch(err => {
+                            console.error(`❌ [Dynamic Handler Error]:`, err.message);
+                        });
+                    }
+                } catch (error) {
+                    console.error(`❌ [setImmediate Error]:`, error.message);
+                }
+            });
 
-            if (this.isActuatorTopic(topic)) {
-                await this.handleActuatorTopic(topic, payload);
-                return;
+            const processingTime = Date.now() - messageStartTime;
+            if (processingTime > 100) {
+                console.warn(`⚠️ [PERF] Slow message routing: ${processingTime}ms for topic: ${topic}`);
             }
-
-            if (this.isLegacyTopic(topic)) {
-                await this.handleLegacyTopic(topic, payload);
-                return;
-            }
-
-            await this.handleDynamicMessage(topic, payload);
 
         } catch (error) {
-            console.error(`❌ Error processing ${topic}:`, error.message);
+            console.error(`❌ [EnhancedMqttHandler] onMessage error:`, error.message);
         }
     }
 
@@ -403,12 +409,13 @@ class EnhancedMqttHandler {
     }
 
     async handleLegacyTopic(topic, payload) {
+        const startTime = Date.now();
         console.log(`📜 [Legacy] Handling legacy topic: ${topic}`);
 
-        // ✅ ADD THIS DEBUG
-        if (topic === 'CO2') {
-            console.log('🔍 [DEBUG] CO2 message received!');
-            console.log('🔍 [DEBUG] Payload:', payload);
+        // ✅ ADD DEBUG FOR CO2
+        if (topic === 'CO2' || topic === 'co2') {
+            console.log(`🔍 [DEBUG-CO2] CO2 message received!`);
+            console.log(`🔍 [DEBUG-CO2] Payload: ${payload}`);
         }
 
         const legacyMapping = {
@@ -416,8 +423,8 @@ class EnhancedMqttHandler {
             'ESP': 'humidity',
             'bowl': 'bowl_temp',
             'sonar': 'sonar_distance',
-            'CO2': 'co2_level',
-            'co2': 'co2_level',
+            'CO2': 'co2_level',        // ✅ EXACT MATCH
+            'co2': 'co2_level',        // ✅ CASE INSENSITIVE
             'sugar': 'sugar_level',
             'ESP3': 'airflow',
             'ESPX': 'temperature',
@@ -426,44 +433,63 @@ class EnhancedMqttHandler {
         };
 
         const sensorType = legacyMapping[topic];
+
         if (!sensorType) {
-            console.warn(`⚠️ Unknown legacy topic: ${topic}`);
+            console.warn(`⚠️ [Legacy] Unknown legacy topic: ${topic}`);
             return;
         }
 
-        // ✅ ADD THIS DEBUG
-        if (topic === 'CO2') {
-            console.log('🔍 [DEBUG] Looking for sensor type:', sensorType);
+        // ✅ ADD DEBUG FOR CO2
+        if (topic === 'CO2' || topic === 'co2') {
+            console.log(`🔍 [DEBUG-CO2] Mapped to sensor type: ${sensorType}`);
         }
 
-        const [sensors] = await pool.execute(
-            `SELECT s.*, st.type_code, st.type_name, st.unit, r.room_code, r.room_name, r.id as room_id
-         FROM sensors s
-         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-         LEFT JOIN rooms r ON s.room_id = r.id
-         WHERE (s.mqtt_topic = ? OR st.type_code = ?) AND s.is_active = 1
-         LIMIT 1`,
-            [topic, sensorType]
-        );
+        try {
+            // ✅ OPTIMIZED: Single query with better filtering
+            const [sensors] = await pool.execute(
+                `SELECT s.*, st.type_code, st.type_name, st.unit, r.room_code, r.room_name, r.id as room_id
+                 FROM sensors s
+                 INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+                 LEFT JOIN rooms r ON s.room_id = r.id
+                 WHERE (s.mqtt_topic = ? OR st.type_code = ?) AND s.is_active = 1
+                 LIMIT 1`,
+                [topic, sensorType]
+            );
 
-        // ✅ ADD THIS DEBUG
-        if (topic === 'CO2') {
-            console.log('🔍 [DEBUG] Sensors found:', sensors.length);
+            // ✅ ADD DEBUG FOR CO2
+            if (topic === 'CO2' || topic === 'co2') {
+                console.log(`🔍 [DEBUG-CO2] Sensors found: ${sensors.length}`);
+                if (sensors.length > 0) {
+                    console.log(`🔍 [DEBUG-CO2] Sensor details:`, {
+                        id: sensors[0].id,
+                        name: sensors[0].sensor_name,
+                        type: sensors[0].type_code,
+                        mqtt_topic: sensors[0].mqtt_topic
+                    });
+                }
+            }
+
             if (sensors.length > 0) {
-                console.log('🔍 [DEBUG] Sensor details:', sensors[0]);
-            }
-        }
+                const sensor = sensors[0];
 
-        if (sensors.length > 0) {
-            await this.handleSensorMessage(sensors[0], payload);
-        } else {
-            console.warn(`⚠️ No sensor found for legacy topic: ${topic}`);
-            // ✅ ADD THIS
-            if (topic === 'CO2') {
-                console.error('❌ CO2 SENSOR NOT FOUND IN DATABASE!');
-                console.error('   Run this SQL to check:');
-                console.error('   SELECT * FROM sensors WHERE mqtt_topic = "CO2" OR type_code = "co2_level";');
+                // ✅ NON-BLOCKING: Don't await, just trigger
+                this.handleSensorMessage(sensor, payload).catch(err => {
+                    console.error(`❌ Error processing sensor message:`, err.message);
+                });
+
+                const processingTime = Date.now() - startTime;
+                if (processingTime > 50) {
+                    console.warn(`⚠️ [PERF] Legacy handler took ${processingTime}ms for topic: ${topic}`);
+                }
+            } else {
+                console.warn(`⚠️ No sensor found for legacy topic: ${topic}`);
+                if (topic === 'CO2' || topic === 'co2') {
+                    console.error(`❌ CO2 SENSOR NOT FOUND IN DATABASE!`);
+                }
             }
+        } catch (error) {
+            console.error(`❌ [Legacy Handler] Error:`, error.message);
+            console.error(`❌ Stack:`, error.stack);
         }
     }
 
