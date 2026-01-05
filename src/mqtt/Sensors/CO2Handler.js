@@ -1,122 +1,141 @@
-const BaseSensorHandler4 = require('../base/BaseSensorHandler');
-const pool4 = require('../../config/db');
+// mqtt/sensors/CO2Handler.js
+const BaseSensorHandler = require('../base/BaseSensorHandler');
+const pool = require('../../config/db');
 
-class CO2Handler extends BaseSensorHandler4 {
+class CO2Handler extends BaseSensorHandler {
     constructor(io, sensorData, activeUsers, sensorDataMutex) {
         super(io, sensorData, activeUsers, sensorDataMutex);
         console.log(`🔵 [CO2Handler] Initialized`);
     }
 
     async handleCO2Data(topic, payload) {
-        console.log(`\n💨 ========== CO2 LEVEL DATA ==========`);
-        const value = parseFloat(payload);
+        const startTime = Date.now();
+        const timestamp = new Date().toISOString();
+        console.log(`\n💨 [CO2] ${timestamp} | Topic: "${topic}" | Payload: "${payload}"`);
 
+        // Validate value
+        const value = parseFloat(payload);
         if (!Number.isFinite(value)) {
-            console.warn(`⚠️ [CO2Handler] Invalid value: ${payload}`);
+            // Check if it's a command echo (GET, READ, etc.)
+            const upperPayload = payload.toString().toUpperCase().trim();
+            if (['GET', 'READ', 'STATUS', '?', ''].includes(upperPayload)) {
+                console.warn(`⚠️ [CO2] Ignoring command echo: "${payload}"`);
+                console.warn(`   💡 Your sensor is echoing back commands instead of sending data`);
+                console.warn(`   💡 Check sensor configuration to enable auto-publish mode`);
+            } else {
+                console.error(`❌ [CO2] Invalid value: ${payload}`);
+            }
             return;
         }
 
-        console.log(`💨 CO2 Level: ${value.toFixed(2)} ppm`);
+        console.log(`✅ [CO2] Valid CO2 reading: ${value.toFixed(2)} ppm`);
+
+        // Update cache immediately (non-blocking)
         this.updateCache('co2_level', value);
 
-        // ✅ Emit sensorData for chart updates
         try {
-            const [sensors] = await pool4.execute(
-                'SELECT id, user_id FROM sensors WHERE mqtt_topic = ? AND is_active = 1',
+            // ✅ OPTIMIZED: Single query to get all sensor data
+            const [sensors] = await pool.execute(
+                `SELECT s.id, s.sensor_name, s.user_id, s.room_id, r.room_code, r.room_name
+                 FROM sensors s
+                 LEFT JOIN rooms r ON s.room_id = r.id
+                 WHERE s.mqtt_topic = ? AND s.is_active = 1`,
                 [topic]
             );
 
-            if (sensors.length > 0) {
-                const sensor = sensors[0];
-                this.io.to(`sensor_${sensor.id}`).emit('sensorData', {
-                    sensorId: sensor.id,
-                    value: value,
-                    timestamp: new Date().toISOString(),
-                    quality: 'good'
-                });
-                console.log(`📡 [CO2Handler] ✅ Emitted sensorData to sensor_${sensor.id}: ${value.toFixed(2)} ppm`);
-            }
-        } catch (error) {
-            console.error(`❌ [CO2Handler] Error emitting sensorData:`, error.message);
-        }
-
-        console.log(`💨 [CO2Handler] Active users: ${this.activeUsers.size}`);
-
-        for (const [userId, rooms] of this.activeUsers) {
-            try {
-                console.log(`🔵 [CO2Handler] Processing user ${userId} with rooms:`, Array.from(rooms));
-
-                for (const roomCode of rooms) {
-                    await this.saveToDB(userId, roomCode, topic, value);
-                }
-
-                this.io.to(`user_${userId}`).emit('co2Update', {
-                    co2_level: value,
-                    timestamp: new Date(),
-                    source: topic
-                });
-                console.log(`📡 [CO2Handler] Emitted to user ${userId}`);
-
-            } catch (error) {
-                console.error(`❌ [CO2Handler] Error for user ${userId}:`, error.message);
-            }
-        }
-
-        console.log(`💨 ========== END CO2 LEVEL DATA ==========\n`);
-    }
-
-    async saveToDB(userId, roomCode, mqttTopic, value) {
-        try {
-            console.log(`🔵 [CO2Handler] Saving - User: ${userId}, Room: ${roomCode}`);
-
-            const [rooms] = await pool4.execute(
-                'SELECT id FROM rooms WHERE user_id = ? AND room_code = ? AND is_active = 1',
-                [userId, roomCode]
-            );
-
-            if (rooms.length === 0) {
-                console.warn(`⚠️ [CO2Handler] No room found for user ${userId}, room_code: ${roomCode}`);
-                return;
-            }
-
-            const roomId = rooms[0].id;
-            console.log(`✅ [CO2Handler] Found room_id: ${roomId}`);
-
-            const [sensors] = await pool4.execute(
-                `SELECT s.id FROM sensors s
-                 INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-                 WHERE s.user_id = ? 
-                 AND s.room_id = ? 
-                 AND st.type_code = 'co2_level'
-                 AND s.is_active = 1
-                 LIMIT 1`,
-                [userId, roomId]
-            );
-
             if (sensors.length === 0) {
-                console.warn(`⚠️ [CO2Handler] No co2_level sensor found in room ${roomId}`);
+                console.error(`❌ [CO2] No sensor found for topic: "${topic}"`);
                 return;
             }
 
-            const sensorId = sensors[0].id;
-            console.log(`✅ [CO2Handler] Found sensor_id: ${sensorId}`);
+            console.log(`🔍 [CO2] Found ${sensors.length} sensor(s)`);
 
-            await pool4.execute(
-                'INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) VALUES (?, ?, NOW(3), 100)',
-                [sensorId, value]
-            );
+            // ✅ OPTIMIZED: Process all sensors in parallel using Promise.all
+            await Promise.all(sensors.map(async (sensor) => {
+                try {
+                    // Batch database operations using a transaction for better performance
+                    const connection = await pool.getConnection();
+                    
+                    try {
+                        await connection.beginTransaction();
 
-            await pool4.execute(
-                'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
-                [sensorId]
-            );
+                        // Insert measurement
+                        const [result] = await connection.execute(
+                            `INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) 
+                             VALUES (?, ?, NOW(3), 100)`,
+                            [sensor.id, value]
+                        );
 
-            console.log(`✅ [CO2Handler] Saved: ${value.toFixed(2)} ppm (sensor_id: ${sensorId})`);
+                        // Update last_reading_at
+                        await connection.execute(
+                            'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
+                            [sensor.id]
+                        );
+
+                        await connection.commit();
+                        console.log(`   ✅ [CO2] Saved measurement ID: ${result.insertId} for sensor ${sensor.id}`);
+
+                    } catch (dbError) {
+                        await connection.rollback();
+                        throw dbError;
+                    } finally {
+                        connection.release();
+                    }
+
+                    // Emit to Socket.IO rooms (non-blocking)
+                    const roomCode = sensor.room_code || sensor.room_name || 'unknown';
+                    const userRoom = `user_${sensor.user_id}_${roomCode}`;
+                    const locationRoom = `location_${roomCode}`;
+                    const sensorRoomName = `sensor_${sensor.id}`;
+                    const emitTimestamp = new Date().toISOString();
+
+                    // Emit all events in parallel
+                    this.io.to(sensorRoomName).emit('sensorData', {
+                        sensorId: sensor.id,
+                        value: value,
+                        timestamp: emitTimestamp,
+                        quality: 'good'
+                    });
+
+                    this.io.to(userRoom).emit('sensorUpdate', {
+                        sensorId: sensor.id,
+                        sensorType: 'co2_level',
+                        sensorName: sensor.sensor_name,
+                        value: value,
+                        unit: 'ppm',
+                        timestamp: emitTimestamp,
+                        roomCode: roomCode,
+                        roomName: sensor.room_name,
+                        source: topic
+                    });
+
+                    this.io.to(locationRoom).emit('chartData', {
+                        sensorId: sensor.id,
+                        sensorType: 'co2_level',
+                        value: value,
+                        timestamp: emitTimestamp,
+                        unit: 'ppm'
+                    });
+
+                    this.io.to(userRoom).emit('environmentUpdate', {
+                        co2_level: value,
+                        timestamp: emitTimestamp
+                    });
+
+                } catch (sensorError) {
+                    console.error(`   ❌ [CO2] Error processing sensor ${sensor.id}:`, sensorError.message);
+                }
+            }));
+
+            const processingTime = Date.now() - startTime;
+            console.log(`💨 [CO2] ✅ Processed in ${processingTime}ms\n`);
 
         } catch (error) {
-            console.error(`❌ [CO2Handler] DB error:`, error.message);
+            console.error(`❌ [CO2] Error:`, error.message);
+            console.error(`   Stack:`, error.stack);
         }
     }
+
 }
 
 module.exports = CO2Handler;

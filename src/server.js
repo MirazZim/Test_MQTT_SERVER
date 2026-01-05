@@ -32,8 +32,8 @@ const io = createSocketIOServer(server);
 // Initialize WebSocket server with path routing (fixed version)
 const wss = createWebSocketServer(server, messageEmitter);
 
-// Initialize MQTT and get the instance
-const { mqttClient, spatialController } = initializeMQTT(io);
+// Initialize MQTT and get the instance (pass app for route access)
+const { mqttClient, spatialController } = initializeMQTT(io, app);
 
 // ✅ CRITICAL FIX: Inject MQTT instance into Socket.IO
 io.setMqtt(mqttClient);
