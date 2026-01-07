@@ -9,13 +9,12 @@ const CO2FermentationHandler = require('./Actuators/CO2FermentationHandler');
 const SugarFermentationHandler = require('./Actuators/SugarFermentationHandler');
 const CameraMonitoringHandler = require('./Actuators/CameraMonitoringHandler');
 
-// Import sensor handlers
-const CO2Handler = require('./Sensors/CO2Handler.js');
-const CO2PollingService = require('./Sensors/CO2PollingService.js');
+// ⚡ Import Real-Time Sensor Service (NO LATENCY for ALL sensors)
+const RealTimeSensorService = require('./Sensors/RealTimeSensorService');
 
 class EnhancedMqttHandler {
     constructor(io) {
-        console.log(`🔵 [EnhancedMqttHandler] Initializing FULLY DYNAMIC MQTT Handler...`);
+        console.log(`🔵 [EnhancedMqttHandler] Initializing REAL-TIME MQTT Handler (NO LATENCY)...`);
         this.io = io;
         this.mqttConnection = new MqttConnection();
         this.mqttClient = null;
@@ -23,7 +22,15 @@ class EnhancedMqttHandler {
         this.subscribedTopics = new Set();
         this.resultsHandler = null;
 
-        // Sensor data cache
+        // ⚡ REAL-TIME: Use RealTimeSensorService for ALL sensors (same as CO2 approach)
+        this.realTimeSensorService = new RealTimeSensorService(io);
+
+        // ⚡ OPTIMIZATION: In-memory cache for actuator configs only
+        this.actuatorCache = new Map();    // topic -> actuator config
+        this.cacheExpiry = 5 * 60 * 1000;  // Refresh cache every 5 minutes
+        this.lastCacheRefresh = 0;
+
+        // Sensor data cache (for real-time display)
         this.sensorData = {
             temperature: null,
             humidity: null,
@@ -35,39 +42,66 @@ class EnhancedMqttHandler {
             co2_fermentation_status: null,
             sugar_level: null,
             sugar_fermentation_status: null,
-            esp3_data: null
+            esp3_data: null,
+            airflow: null
         };
 
         this.sensorDataMutex = new Mutex();
         this.locationMutexes = new Map();
         this.cleanupInterval = null;
-        this.co2PollingService = null;
 
-        // Initialize sensor handlers FIRST
+        // Initialize handlers
         this.initializeSensorHandlers();
-
-        // Then initialize actuator handlers
         this.initializeActuatorHandlers();
 
-        console.log(`✅ [EnhancedMqttHandler] Initialized with dynamic handler`);
+        // Start cache refresh interval
+        this.startCacheRefresh();
+
+        console.log(`✅ [EnhancedMqttHandler] Initialized with REAL-TIME mode (NO LATENCY for ALL sensors)`);
+    }
+
+    // ⚡ REAL-TIME: Load configs into memory
+    async loadConfigCache() {
+        try {
+            // Load sensors via RealTimeSensorService
+            await this.realTimeSensorService.loadSensorCache();
+
+            // Load actuators
+            const [actuators] = await pool.execute(
+                `SELECT a.*, at.type_code, at.type_name, at.control_type,
+                 r.room_code, r.room_name, r.id as room_id
+                 FROM actuators a
+                 INNER JOIN actuator_types at ON a.actuator_type_id = at.id
+                 LEFT JOIN rooms r ON a.room_id = r.id
+                 WHERE a.is_active = 1 AND a.mqtt_topic IS NOT NULL`
+            );
+
+            this.actuatorCache.clear();
+            for (const actuator of actuators) {
+                this.actuatorCache.set(actuator.mqtt_topic, actuator);
+            }
+
+            this.lastCacheRefresh = Date.now();
+            console.log(`🔄 [CACHE] Loaded ${this.realTimeSensorService.sensorCache.size} sensors, ${this.actuatorCache.size} actuators (REAL-TIME mode)`);
+        } catch (error) {
+            console.error('❌ [CACHE] Failed to load config:', error.message);
+        }
+    }
+
+    startCacheRefresh() {
+        // Refresh cache periodically
+        setInterval(() => this.loadConfigCache(), this.cacheExpiry);
     }
 
     initializeSensorHandlers() {
         console.log(`🔵 [EnhancedMqttHandler] Initializing sensor handlers...`);
 
-        // Initialize CO2 Handler
-        this.co2Handler = new CO2Handler(
-            this.io,
-            this.sensorData,
-            this.activeUsers,
-            this.sensorDataMutex
-        );
-
-        // You can add more sensor handlers here in the future
+        // All sensors use generic handler - no specialized handlers needed
+        // You can add specialized handlers here in the future if needed
         // this.temperatureHandler = new TemperatureHandler(...);
         // this.humidityHandler = new HumidityHandler(...);
 
-        console.log(`✅ [EnhancedMqttHandler] Sensor handlers initialized`);
+        console.log(`✅ [EnhancedMqttHandler] Sensor handlers initialized (using generic handler)`);
     }
 
     initializeActuatorHandlers() {
@@ -188,15 +222,14 @@ class EnhancedMqttHandler {
         this.mqttClient = client;
 
         try {
-            // Fully dynamic: subscribe only based on DB configuration
+            // ⚡ OPTIMIZATION: Load config cache FIRST
+            await this.loadConfigCache();
+
+            // Subscribe based on cached config
             await this.subscribeToAllActiveSensors(client);
             await this.subscribeToAllActiveActuators(client);
 
-            // ✅ NEW: Start CO2 polling service
-            console.log(`🚀 [EnhancedMqttHandler] Starting CO2 polling service...`);
-            this.co2PollingService = new CO2PollingService(this.mqttClient, this.co2Handler);
-            await this.co2PollingService.start();
-            console.log(`✅ [EnhancedMqttHandler] CO2 polling service started`);
+            console.log(`✅ [EnhancedMqttHandler] All subscriptions complete - ready to receive data`);
         } catch (error) {
             console.error('❌ [EnhancedMqttHandler] Error during initial subscription:', error);
         }
@@ -291,304 +324,171 @@ class EnhancedMqttHandler {
     }
 
     async onMessage(topic, message) {
-        const messageStartTime = Date.now();
-
-        // ✅ Log every single MQTT message clearly
-        console.log(`\n${'='.repeat(80)}`);
-        console.log(`📨 [MQTT RAW] INCOMING MESSAGE`);
-        console.log(`  ⏱️  Time: ${new Date().toISOString()}`);
-        console.log(`  📍 Topic: "${topic}"`);
-        console.log(`  📦 Payload: "${message.toString('utf8')}"`);
-        console.log(`  📏 Size: ${message.length} bytes`);
-        console.log(`${'='.repeat(80)}\n`);
+        const payload = message.toString('utf8');
 
         if (message.length > 10000) {
-            console.warn(`⚠️  [EnhancedMqttHandler] Message too large: ${message.length} bytes`);
+            console.warn(`⚠️ Message too large: ${message.length} bytes`);
             return;
         }
 
-        const payload = message.toString('utf8');
-
         try {
-            // Process messages immediately to ensure no data loss
-            // Critical for high-frequency sensors like CO2 that send data every second
-            console.log(`🔄 [MQTT] Processing topic: "${topic}" with payload: "${payload}"`);
-
-            // Use Promise to handle async operations without blocking MQTT client
-            this.handleDynamicMessage(topic, payload)
-                .then(() => {
-                    const processingTime = Date.now() - messageStartTime;
-                    console.log(`✅ [MQTT] Successfully processed topic: "${topic}" in ${processingTime}ms`);
-
-                    if (processingTime > 100) {
-                        console.warn(`⚠️  [PERF] Slow message processing: ${processingTime}ms for topic: ${topic}`);
-                    }
-                })
-                .catch((error) => {
-                    console.error(`❌ [Dynamic Handler Error] Topic: "${topic}":`, error.message);
-                    console.error(`   Stack:`, error.stack);
-                });
-
+            await this.handleDynamicMessage(topic, payload);
         } catch (error) {
-            console.error(`❌ [EnhancedMqttHandler] onMessage error for topic "${topic}":`, error.message);
-            console.error(`   Stack:`, error.stack);
+            console.error(`❌ onMessage error for "${topic}":`, error.message);
         }
     }
 
+
     async handleDynamicMessage(topic, payload) {
         try {
-            console.log(`\n🔍 [DYNAMIC ROUTING] Starting resolution for topic: "${topic}"`);
-
-            // Check sensors first
-            console.log(`  🔎 [STEP 1] Querying database for sensor with topic: "${topic}"`);
-            const [sensors] = await pool.execute(
-                `SELECT s.*, st.type_code, st.type_name, st.unit,
-                r.room_code, r.room_name, r.id as room_id
-         FROM sensors s
-         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-         LEFT JOIN rooms r ON s.room_id = r.id
-         WHERE s.mqtt_topic = ? AND s.is_active = 1
-         LIMIT 1`,
-                [topic]
-            );
-
-            if (sensors.length > 0) {
-                const sensor = sensors[0];
-                console.log(`  ✅ [STEP 1] Found sensor for topic "${topic}":`, {
-                    id: sensor.id,
-                    name: sensor.sensor_name,
-                    type_code: sensor.type_code,
-                    type_name: sensor.type_name,
-                    user_id: sensor.user_id,
-                    room_code: sensor.room_code
-                });
-
-                await this.handleSensorMessage(sensor, payload);
-                console.log(`  ✅ [ROUTING COMPLETE] Sensor handler finished for topic: "${topic}"\n`);
+            // ⚡ REAL-TIME: Try sensor handling first via RealTimeSensorService
+            const sensorHandled = await this.realTimeSensorService.handleSensorData(topic, payload);
+            if (sensorHandled) {
+                // Update local sensorData cache for compatibility
+                const sensor = await this.realTimeSensorService.getSensorConfig(topic);
+                if (sensor && this.sensorData.hasOwnProperty(sensor.type_code)) {
+                    const value = parseFloat(payload);
+                    if (Number.isFinite(value)) {
+                        this.sensorData[sensor.type_code] = value;
+                    }
+                }
                 return;
             }
 
-            console.warn(`  ⚠️  [STEP 1] No sensor found for topic: "${topic}"`);
-            console.warn(`  🔎 [STEP 2] Checking actuators...`);
+            // Check actuator cache
+            const actuator = this.actuatorCache.get(topic);
+            if (actuator) {
+                await this.handleActuatorMessage(actuator, payload);
+                return;
+            }
 
-            // Then check actuators
+            // Cache miss for actuator - try DB lookup and update cache
             const [actuators] = await pool.execute(
                 `SELECT a.*, at.type_code, at.type_name, at.control_type,
-                r.room_code, r.room_name, r.id as room_id
-         FROM actuators a
-         INNER JOIN actuator_types at ON a.actuator_type_id = at.id
-         LEFT JOIN rooms r ON a.room_id = r.id
-         WHERE a.mqtt_topic = ? AND a.is_active = 1
-         LIMIT 1`,
+                 r.room_code, r.room_name, r.id as room_id
+                 FROM actuators a
+                 INNER JOIN actuator_types at ON a.actuator_type_id = at.id
+                 LEFT JOIN rooms r ON a.room_id = r.id
+                 WHERE a.mqtt_topic = ? AND a.is_active = 1
+                 LIMIT 1`,
                 [topic]
             );
 
             if (actuators.length > 0) {
-                const actuator = actuators[0];
-                console.log(`  ✅ [STEP 2] Found actuator for topic "${topic}":`, {
-                    id: actuator.id,
-                    name: actuator.actuator_name,
-                    type_code: actuator.type_code,
-                    type_name: actuator.type_name
-                });
-
-                await this.handleActuatorMessage(actuator, payload);
-                console.log(`  ✅ [ROUTING COMPLETE] Actuator handler finished for topic: "${topic}"\n`);
+                this.actuatorCache.set(topic, actuators[0]); // Update cache
+                await this.handleActuatorMessage(actuators[0], payload);
                 return;
             }
 
-            console.error(`\n❌ [CRITICAL] No sensor or actuator found for topic: "${topic}"`);
-            console.error(`   Make sure your device is registered in the database`);
-            console.error(`   Topic received: "${topic}"`);
-            console.error(`   Payload: "${payload}"\n`);
+            console.warn(`⚠️ No sensor/actuator found for topic: "${topic}"`);
         } catch (error) {
-            console.error(`❌ Error handling message:`, error.message);
-            console.error(`   Stack:`, error.stack);
+            console.error(`❌ Error handling message for topic "${topic}":`, error.message);
         }
     }
 
-    async handleSensorMessage(sensor, payload) {
-        console.log(`\n🔀 [SENSOR ROUTING] ===============================`);
-        console.log(`  📊 Sensor Name: ${sensor.sensor_name}`);
-        console.log(`  🏷️  Type Code: ${sensor.type_code}`);
-        console.log(`  🏷️  Type Name: ${sensor.type_name}`);
-        console.log(`  📍 Topic: ${sensor.mqtt_topic}`);
-        console.log(`  📦 Payload: ${payload}`);
-        console.log(`  👤 User ID: ${sensor.user_id}`);
-        console.log(`  🏠 Room: ${sensor.room_code || sensor.room_name || 'N/A'}`);
-        console.log(`================================================\n`);
-
-        // Dynamic routing based on sensor type_code from database
-        // Check if specialized handler exists for this sensor type
-        const handlerMap = {
-            'co2_level': this.co2Handler,
-            // Add more mappings as you create specialized handlers
-            // 'temperature': this.temperatureHandler,
-            // 'humidity': this.humidityHandler,
-        };
-
-        const specializedHandler = handlerMap[sensor.type_code];
-
-        if (specializedHandler) {
-            console.log(`🔀 [ROUTING] Found specialized handler for type: "${sensor.type_code}"`);
-            console.log(`  🎯 Calling handler method...`);
-
-            try {
-                // Call the specialized handler dynamically
-                const handlerMethodName = `handle${sensor.type_code.split('_').map(word =>
-                    word.charAt(0).toUpperCase() + word.slice(1)
-                ).join('')}Data`;
-
-                // For co2_level, this becomes: handleCo2LevelData
-                // But we named it handleCO2Data, so let's use a simpler approach
-
-                if (sensor.type_code === 'co2_level' && this.co2Handler.handleCO2Data) {
-                    await this.co2Handler.handleCO2Data(sensor.mqtt_topic, payload);
-
-                    // Notify polling service that data was received
-                    if (this.co2PollingService) {
-                        this.co2PollingService.onDataReceived(sensor.mqtt_topic, payload);
-                    }
-
-                    console.log(`  ✅ [ROUTING] Specialized handler completed successfully\n`);
-                    return;
-                }
-
-                // Future handlers can follow the same pattern
-                // if (sensor.type_code === 'temperature' && this.temperatureHandler.handleTemperatureData) {
-                //   await this.temperatureHandler.handleTemperatureData(sensor.mqtt_topic, payload);
-                //   return;
-                // }
-
-            } catch (error) {
-                console.error(`❌ [ROUTING] Specialized handler failed:`, error.message);
-                console.error(`   Stack:`, error.stack);
-                console.error(`   Falling back to generic handler...\n`);
-                // Fall through to generic handler as backup
-            }
-        } else {
-            console.log(`🔀 [ROUTING] No specialized handler for type: "${sensor.type_code}"`);
-            console.log(`  🔧 Using generic sensor handler...\n`);
-        }
-
-        // Generic handler for sensors without specialized handlers
-        const release = await this.sensorDataMutex.acquire();
-        try {
-            console.log(`📊 [GENERIC HANDLER] Processing sensor: ${sensor.sensor_name} (${sensor.type_code})`);
-
-            if (!sensor.id || !sensor.user_id) {
-                console.error('  ❌ Invalid sensor data - missing id or user_id');
-                return;
-            }
-
-            let value;
-
-            // Handle different value types
-            if (sensor.type_code.includes('status') || sensor.unit === 'status') {
-                value = payload.toUpperCase() === 'ON' ? 1 : 0;
-                console.log(`  🔄 Parsed status value: ${payload} → ${value}`);
-            } else {
-                value = parseFloat(payload);
-                if (!Number.isFinite(value) || Math.abs(value) > 1e10) {
-                    console.warn(`  ⚠️  Invalid numeric value: ${payload}`);
-                    return;
-                }
-                console.log(`  🔄 Parsed numeric value: ${value}`);
-            }
-
-            // Update cache
-            if (this.sensorData.hasOwnProperty(sensor.type_code)) {
-                this.sensorData[sensor.type_code] = value;
-                console.log(`  🔄 [CACHE] Updated: ${sensor.type_code} = ${value}`);
-            }
-
-            // Save to database
-            console.log(`  💾 [DB] Saving measurement...`);
-            const [insertResult] = await pool.execute(
-                `INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator)
-         VALUES (?, ?, NOW(3), 100)`,
-                [sensor.id, value]
-            );
-            console.log(`  💾 [DB] Measurement inserted with ID: ${insertResult.insertId}`);
-
-            await pool.execute(
-                'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
-                [sensor.id]
-            );
-            console.log(`  💾 [DB] Updated last_reading_at for sensor ${sensor.id}`);
-
-            console.log(`  ✅ Saved: ${value} ${sensor.unit || ''} for ${sensor.sensor_name} (ID: ${sensor.id})`);
-
-            const timestamp = new Date().toISOString();
-            const roomCode = sensor.room_code || sensor.room_name || 'unknown';
-
-            const sensorData = {
-                sensorId: sensor.id,
-                sensorType: sensor.type_code,
-                sensorName: sensor.sensor_name,
-                roomCode: roomCode,
-                roomName: sensor.room_name,
-                location: roomCode,
-                roomId: sensor.room_id,
-                value: value,
-                unit: sensor.unit || '',
-                timestamp: timestamp,
-                topic: sensor.mqtt_topic
-            };
-
-            // Emit to Socket.IO rooms
-            console.log(`  📡 [EMIT] Broadcasting to Socket.IO rooms...`);
-            const userRoom = `user_${sensor.user_id}_${roomCode}`;
-            const locationRoom = `location_${roomCode}`;
-
-            this.io.to(userRoom).emit('sensorUpdate', sensorData);
-            console.log(`    ✅ sensorUpdate → ${userRoom}`);
-
-            this.io.to(locationRoom).emit('chartData', {
-                sensorId: sensor.id,
-                sensorType: sensor.type_code,
-                value: value,
-                timestamp: timestamp,
-                unit: sensor.unit || ''
-            });
-            console.log(`    ✅ chartData → ${locationRoom}`);
-
-            this.io.to(userRoom).emit('environmentUpdate', {
-                [sensor.type_code]: value,
-                timestamp: timestamp
-            });
-            console.log(`    ✅ environmentUpdate → ${userRoom}`);
-
-            console.log(`  ✅ [GENERIC HANDLER] Processing complete\n`);
-
-        } catch (error) {
-            console.error(`❌ Error handling sensor:`, error.message);
-            console.error(`   Stack:`, error.stack);
-        } finally {
-            release();
-        }
-    }
+    // ⚡ REAL-TIME: Sensor handling is now done by RealTimeSensorService
+    // The handleSensorMessage method has been replaced by realTimeSensorService.handleSensorData()
+    // which provides immediate database writes and Socket.IO emissions (same as CO2 approach)
 
     async handleActuatorMessage(actuator, payload) {
         try {
-            console.log(`\n🎛️  [ACTUATOR HANDLER] Processing actuator: ${actuator.actuator_name} (${actuator.type_code})`);
-            console.log(`  📦 Payload: ${payload}`);
-            console.log(`  🔧 Control Type: ${actuator.control_type || 'binary'}`);
-
             const controlType = actuator.control_type || 'binary';
 
             if (controlType === 'analog') {
-                console.log(`  🔀 Routing to analog actuator handler`);
                 await this.handleAnalogActuator(actuator, payload);
+            } else if (controlType === 'text') {
+                await this.handleTextActuator(actuator, payload);
             } else {
-                console.log(`  🔀 Routing to binary actuator handler`);
                 await this.handleBinaryActuator(actuator, payload);
             }
-
-            console.log(`  ✅ [ACTUATOR HANDLER] Processing complete\n`);
         } catch (error) {
             console.error(`❌ Error handling actuator ${actuator.actuator_name}:`, error.message);
-            console.error(`   Stack:`, error.stack);
+        }
+    }
+
+    // Handle text-based actuators (AF, CF, FO, FS, PO, PS, FFC, FFO)
+    async handleTextActuator(actuator, payload) {
+        try {
+            const state = payload.trim().toUpperCase();
+
+            // Map text codes to readable status and messages
+            const statusMap = {
+                // CO2T: Active/Closed Fermentation
+                'AF': { status: 'ACTIVE', message: '🫧 Active Fermentation' },
+                'CF': { status: 'CLOSED', message: '⏸️ Closed Fermentation' },
+                // bowlT: Fan On/Stop
+                'FO': { status: 'ON', message: '🌀 Fan is ON' },
+                'FS': { status: 'OFF', message: '⏹️ Fan Stopped' },
+                // sonarT: Pump On/Stop
+                'PO': { status: 'ON', message: '💧 Pump is ON' },
+                'PS': { status: 'OFF', message: '⏹️ Pump Stopped' },
+                // sugarT: Fermentation Complete/Ongoing
+                'FFC': { status: 'COMPLETE', message: '✅ Fermentation Complete' },
+                'FFO': { status: 'ONGOING', message: '🔄 Fermentation Ongoing' }
+            };
+
+            const mapped = statusMap[state] || { status: state, message: `Status: ${state}` };
+
+            // Update actuator current_state
+            await pool.execute(
+                'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
+                [state, actuator.id]
+            );
+
+            // Log to actuator_control_logs
+            await pool.execute(
+                `INSERT INTO actuator_control_logs
+                 (actuator_id, command_value, command_source, executed_at)
+                 VALUES (?, ?, 'mqtt', NOW())`,
+                [actuator.id, state]
+            );
+
+            // Update or insert actuator_states
+            const [existingState] = await pool.execute(
+                `SELECT id FROM actuator_states
+                 WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
+                [actuator.user_id, actuator.room_id, actuator.type_code]
+            );
+
+            if (existingState.length > 0) {
+                await pool.execute(
+                    `UPDATE actuator_states
+                     SET status = ?, message = ?, state = ?, timestamp = NOW()
+                     WHERE id = ?`,
+                    [mapped.status, mapped.message, state, existingState[0].id]
+                );
+            } else {
+                await pool.execute(
+                    `INSERT INTO actuator_states
+                     (user_id, room_id, actuator_type, status, message, state, timestamp)
+                     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                    [actuator.user_id, actuator.room_id, actuator.type_code, mapped.status, mapped.message, state]
+                );
+            }
+
+            // Emit to Socket.IO
+            const roomCode = actuator.room_code || actuator.room_name;
+            if (roomCode) {
+                const userRoom = `user_${actuator.user_id}_${roomCode}`;
+
+                this.io.to(userRoom).emit('actuatorUpdate', {
+                    actuatorId: actuator.id,
+                    actuatorType: actuator.type_code,
+                    actuatorName: actuator.actuator_name,
+                    roomCode: roomCode,
+                    roomName: actuator.room_name,
+                    state: mapped.status,
+                    rawState: state,
+                    message: mapped.message,
+                    timestamp: new Date().toISOString(),
+                    topic: actuator.mqtt_topic
+                });
+
+                console.log(`🎛️ ${actuator.type_code}: ${state} (${mapped.status}) → ${userRoom}`);
+            }
+        } catch (error) {
+            console.error(`❌ Error in handleTextActuator:`, error.message);
+            throw error;
         }
     }
 
@@ -597,9 +497,6 @@ class EnhancedMqttHandler {
             const state = payload.toUpperCase();
             const numericState = state === 'ON' ? 1 : 0;
 
-            console.log(`  🔄 Binary state: ${payload} → ${state} (${numericState})`);
-
-            console.log(`  💾 [DB] Updating actuator state...`);
             await pool.execute(
                 'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
                 [state.toLowerCase(), actuator.id]
@@ -607,72 +504,49 @@ class EnhancedMqttHandler {
 
             await pool.execute(
                 `INSERT INTO actuator_control_logs
-         (actuator_id, command_value, command_source, executed_at)
-         VALUES (?, ?, 'mqtt', NOW())`,
+                 (actuator_id, command_value, command_source, executed_at)
+                 VALUES (?, ?, 'mqtt', NOW())`,
                 [actuator.id, numericState]
             );
-            console.log(`  💾 [DB] Control log created`);
 
             const [existingState] = await pool.execute(
                 `SELECT id FROM actuator_states
-         WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
+                 WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
                 [actuator.user_id, actuator.room_id, actuator.type_code]
             );
 
             if (existingState.length > 0) {
                 await pool.execute(
                     `UPDATE actuator_states
-           SET status = ?, message = ?, state = ?, timestamp = NOW()
-           WHERE id = ?`,
-                    [
-                        state,
-                        this.getActuatorMessage(actuator.type_code, state),
-                        numericState,
-                        existingState[0].id
-                    ]
+                     SET status = ?, message = ?, state = ?, timestamp = NOW()
+                     WHERE id = ?`,
+                    [state, this.getActuatorMessage(actuator.type_code, state), numericState, existingState[0].id]
                 );
-                console.log(`  💾 [DB] Actuator state updated (ID: ${existingState[0].id})`);
             } else {
                 await pool.execute(
                     `INSERT INTO actuator_states
-           (user_id, room_id, actuator_type, status, message, state, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-                    [
-                        actuator.user_id,
-                        actuator.room_id,
-                        actuator.type_code,
-                        state,
-                        this.getActuatorMessage(actuator.type_code, state),
-                        numericState
-                    ]
+                     (user_id, room_id, actuator_type, status, message, state, timestamp)
+                     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                    [actuator.user_id, actuator.room_id, actuator.type_code, state, this.getActuatorMessage(actuator.type_code, state), numericState]
                 );
-                console.log(`  💾 [DB] New actuator state created`);
             }
-
-            console.log(`  ✅ Logged binary actuator state: ${state}`);
 
             const roomCode = actuator.room_code || actuator.room_name;
-            if (!roomCode) {
-                console.warn(`  ⚠️  No room code for actuator ${actuator.actuator_name}`);
-                return;
+            if (roomCode) {
+                const userRoom = `user_${actuator.user_id}_${roomCode}`;
+                this.io.to(userRoom).emit('actuatorUpdate', {
+                    actuatorId: actuator.id,
+                    actuatorType: actuator.type_code,
+                    actuatorName: actuator.actuator_name,
+                    roomCode: roomCode,
+                    roomName: actuator.room_name,
+                    state: state,
+                    numericState: numericState,
+                    timestamp: new Date().toISOString(),
+                    topic: actuator.mqtt_topic
+                });
+                console.log(`🎛️ ${actuator.type_code}: ${state} → ${userRoom}`);
             }
-
-            const userRoom = `user_${actuator.user_id}_${roomCode}`;
-            console.log(`  📡 [EMIT] Broadcasting to: ${userRoom}`);
-
-            this.io.to(userRoom).emit('actuatorUpdate', {
-                actuatorId: actuator.id,
-                actuatorType: actuator.type_code,
-                actuatorName: actuator.actuator_name,
-                roomCode: roomCode,
-                roomName: actuator.room_name,
-                state: state,
-                numericState: numericState,
-                timestamp: new Date().toISOString(),
-                topic: actuator.mqtt_topic
-            });
-            console.log(`  ✅ actuatorUpdate emitted`);
-
         } catch (error) {
             console.error(`❌ Error in handleBinaryActuator:`, error.message);
             throw error;
@@ -684,11 +558,9 @@ class EnhancedMqttHandler {
             const value = parseInt(payload);
 
             if (isNaN(value) || value < 0 || value > 100) {
-                console.warn(`  ⚠️  Invalid analog value: ${payload} (must be 0-100)`);
+                console.warn(`⚠️ Invalid analog value: ${payload} (must be 0-100)`);
                 return;
             }
-
-            console.log(`  🔄 Analog value: ${payload} → ${value}%`);
 
             let status = '';
             let statusMessage = '';
@@ -707,9 +579,6 @@ class EnhancedMqttHandler {
                 statusMessage = `🌀 ${actuator.actuator_name}: HIGH (${value}%)`;
             }
 
-            console.log(`  📊 Status: ${status} - ${statusMessage}`);
-
-            console.log(`  💾 [DB] Updating actuator state...`);
             await pool.execute(
                 'UPDATE actuators SET current_state = ?, updated_at = NOW() WHERE id = ?',
                 [value.toString(), actuator.id]
@@ -717,80 +586,62 @@ class EnhancedMqttHandler {
 
             await pool.execute(
                 `INSERT INTO actuator_control_logs
-         (actuator_id, command_value, command_source, executed_at)
-         VALUES (?, ?, 'mqtt', NOW())`,
+                 (actuator_id, command_value, command_source, executed_at)
+                 VALUES (?, ?, 'mqtt', NOW())`,
                 [actuator.id, value]
             );
-            console.log(`  💾 [DB] Control log created`);
 
             const [existingState] = await pool.execute(
                 `SELECT id FROM actuator_states
-         WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
+                 WHERE user_id = ? AND room_id = ? AND actuator_type = ?`,
                 [actuator.user_id, actuator.room_id, actuator.type_code]
             );
 
             if (existingState.length > 0) {
                 await pool.execute(
                     `UPDATE actuator_states
-           SET status = ?, message = ?, state = ?, timestamp = NOW()
-           WHERE id = ?`,
+                     SET status = ?, message = ?, state = ?, timestamp = NOW()
+                     WHERE id = ?`,
                     [status, statusMessage, value, existingState[0].id]
                 );
-                console.log(`  💾 [DB] Actuator state updated (ID: ${existingState[0].id})`);
             } else {
                 await pool.execute(
                     `INSERT INTO actuator_states
-           (user_id, room_id, actuator_type, status, message, state, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-                    [
-                        actuator.user_id,
-                        actuator.room_id,
-                        actuator.type_code,
-                        status,
-                        statusMessage,
-                        value
-                    ]
+                     (user_id, room_id, actuator_type, status, message, state, timestamp)
+                     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+                    [actuator.user_id, actuator.room_id, actuator.type_code, status, statusMessage, value]
                 );
-                console.log(`  💾 [DB] New actuator state created`);
             }
-
-            console.log(`  ✅ Logged analog actuator: ${actuator.actuator_name} = ${value}%`);
 
             const roomCode = actuator.room_code || actuator.room_name;
-            if (!roomCode) {
-                console.warn(`  ⚠️  No room code for actuator ${actuator.actuator_name}`);
-                return;
-            }
-
-            const userRoom = `user_${actuator.user_id}_${roomCode}`;
-            console.log(`  📡 [EMIT] Broadcasting to: ${userRoom}`);
-
-            this.io.to(userRoom).emit('actuatorUpdate', {
-                actuatorId: actuator.id,
-                actuatorType: actuator.type_code,
-                actuatorName: actuator.actuator_name,
-                roomCode: roomCode,
-                roomName: actuator.room_name,
-                state: status,
-                value: value,
-                timestamp: new Date().toISOString(),
-                topic: actuator.mqtt_topic
-            });
-            console.log(`  ✅ actuatorUpdate emitted`);
-
-            // Special handling for fan speed control
-            if (actuator.type_code === 'fan_speed_control') {
-                this.io.to(userRoom).emit('fanSpeedUpdate', {
-                    speed: value,
-                    status: status,
-                    level: status,
+            if (roomCode) {
+                const userRoom = `user_${actuator.user_id}_${roomCode}`;
+                this.io.to(userRoom).emit('actuatorUpdate', {
+                    actuatorId: actuator.id,
+                    actuatorType: actuator.type_code,
+                    actuatorName: actuator.actuator_name,
                     roomCode: roomCode,
-                    roomId: actuator.room_id,
-                    timestamp: new Date().toISOString()
+                    roomName: actuator.room_name,
+                    state: status,
+                    value: value,
+                    timestamp: new Date().toISOString(),
+                    topic: actuator.mqtt_topic
                 });
-                console.log(`  ✅ fanSpeedUpdate emitted`);
-            }
 
+                // Special handling for fan speed control
+                if (actuator.type_code === 'fan_speed_control') {
+                    this.io.to(userRoom).emit('fanSpeedUpdate', {
+                        speed: value,
+                        status: status,
+                        level: status,
+                        roomCode: roomCode,
+                        roomId: actuator.room_id,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+
+                console.log(`🎛️ ${actuator.type_code}: ${value}% (${status}) → ${userRoom}`);
+            }
         } catch (error) {
             console.error(`❌ Error in handleAnalogActuator:`, error.message);
             throw error;
@@ -904,26 +755,13 @@ class EnhancedMqttHandler {
 
     disconnect() {
         console.log(`🔵 Disconnecting...`);
+
         if (this.cleanupInterval) {
             clearInterval(this.cleanupInterval);
             this.cleanupInterval = null;
         }
 
-        // Stop CO2 polling service
-        if (this.co2PollingService) {
-            this.co2PollingService.stop();
-            this.co2PollingService = null;
-        }
-
         this.mqttConnection.disconnect();
-    }
-
-    // Get CO2 polling status
-    getCO2PollingStatus() {
-        if (this.co2PollingService) {
-            return this.co2PollingService.getStatus();
-        }
-        return { isPolling: false, message: 'Polling service not initialized' };
     }
 }
 

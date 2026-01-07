@@ -89,6 +89,12 @@ class CO2Handler extends BaseSensorHandler {
                     const sensorRoomName = `sensor_${sensor.id}`;
                     const emitTimestamp = new Date().toISOString();
 
+                    console.log(`   📡 [CO2] Emitting to rooms:`);
+                    console.log(`      • sensorRoomName: "${sensorRoomName}"`);
+                    console.log(`      • userRoom: "${userRoom}"`);
+                    console.log(`      • locationRoom: "${locationRoom}"`);
+                    console.log(`      • Value: ${value} ppm`);
+
                     // Emit all events in parallel
                     this.io.to(sensorRoomName).emit('sensorData', {
                         sensorId: sensor.id,
@@ -121,6 +127,8 @@ class CO2Handler extends BaseSensorHandler {
                         co2_level: value,
                         timestamp: emitTimestamp
                     });
+
+                    console.log(`   ✅ [CO2] All Socket.IO events emitted`);
 
                 } catch (sensorError) {
                     console.error(`   ❌ [CO2] Error processing sensor ${sensor.id}:`, sensorError.message);
