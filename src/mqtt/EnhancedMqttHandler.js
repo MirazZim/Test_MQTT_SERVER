@@ -235,13 +235,15 @@ class EnhancedMqttHandler {
         }
     }
 
+    // Find this method in EnhancedMqttHandler.js and replace it:
+
     async subscribeToAllActiveSensors(client) {
         try {
             const [sensors] = await pool.execute(
                 `SELECT DISTINCT s.mqtt_topic, st.type_code, st.type_name
-         FROM sensors s
-         INNER JOIN sensor_types st ON s.sensor_type_id = st.id
-         WHERE s.is_active = 1 AND s.mqtt_topic IS NOT NULL AND s.mqtt_topic != ''`
+             FROM sensors s
+             INNER JOIN sensor_types st ON s.sensor_type_id = st.id
+             WHERE s.is_active = 1 AND s.mqtt_topic IS NOT NULL AND s.mqtt_topic != ''`
             );
 
             console.log(`📡 [EnhancedMqttHandler] Found ${sensors.length} active sensor topics`);
@@ -269,6 +271,8 @@ class EnhancedMqttHandler {
                     }
                 }
             }
+
+            console.log(`✅ [EnhancedMqttHandler] Primary client subscribed to ${this.subscribedTopics.size} topics total`);
         } catch (error) {
             console.error('❌ Database error subscribing to sensors:', error.message);
         }
@@ -326,6 +330,10 @@ class EnhancedMqttHandler {
     async onMessage(topic, message) {
         const payload = message.toString('utf8');
 
+        if (topic === 'CO2') {
+            console.log(`🔴 [PRIMARY CLIENT] Received CO2: "${payload}"`);
+        }
+
         if (message.length > 10000) {
             console.warn(`⚠️ Message too large: ${message.length} bytes`);
             return;
@@ -340,9 +348,13 @@ class EnhancedMqttHandler {
 
 
     async handleDynamicMessage(topic, payload) {
+        const timestamp = new Date().toISOString();
+        console.log(`🔄 [${timestamp}] [handleDynamicMessage] Topic: "${topic}" | Payload: "${payload}" | Raw message type: ${typeof payload}`);
         try {
             // ⚡ REAL-TIME: Try sensor handling first via RealTimeSensorService
+            console.log(`🔄 [handleDynamicMessage] Trying RealTimeSensorService...`);
             const sensorHandled = await this.realTimeSensorService.handleSensorData(topic, payload);
+            console.log(`🔄 [handleDynamicMessage] RealTimeSensorService result: ${sensorHandled}`);
             if (sensorHandled) {
                 // Update local sensorData cache for compatibility
                 const sensor = await this.realTimeSensorService.getSensorConfig(topic);

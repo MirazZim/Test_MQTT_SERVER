@@ -8,11 +8,12 @@ const USERNAME = 'admin';
 const PASSWORD = 'StrongPassword123';
 
 const SEN1_TOPIC = 'level';
+const { format } = require('date-fns');
 
 // ---------- MQTT OPTIONS ----------
 const options = {
   port: PORT,
-  clientId: 'js_subscriber_001',
+  clientId: `sonar_test_${Date.now()}`,
   username: USERNAME,
   password: PASSWORD,
   clean: true,
@@ -37,7 +38,7 @@ client.on('connect', () => {
 // ---------- MESSAGE ----------
 client.on('message', (topic, message) => {
   console.log(
-    `[subscriber] RECV ${topic} | payload=${message.toString()} | time=${new Date()}`
+    `[subscriber] RECV ${topic} | payload=${message.toString()} | time=${format(new Date(), 'yyyy-MM-dd HH:mm:ss')}`
   );
 });
 

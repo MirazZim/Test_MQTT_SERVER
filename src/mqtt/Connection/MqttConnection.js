@@ -6,12 +6,16 @@ const path = require("path");
 class MqttConnection {
     constructor() {
         this.mqttClient = null;
-        this.co2Client = null; // Secondary client for CO2
+        this.co2Client = null;
         this.host = process.env.MQTT_HOST || "mqtts://192.168.88.221:8883";
-        this.co2Host = process.env.MQTT_HOST_CO2; // Optional secondary broker for CO2
+        this.co2Host = process.env.MQTT_HOST_CO2;
         this.isTLS = this.host.startsWith('mqtts://');
         this.tlsOptions = this.isTLS ? this.prepareTLSOptions() : {};
-        
+
+        // Diagnostic tracking
+        this.co2MessageCount = 0;
+        this.co2LastMessage = null;
+
         console.log(`🔗 Primary MQTT Host: ${this.host} (TLS: ${this.isTLS})`);
         if (this.co2Host) {
             console.log(`🔗 Secondary MQTT Host (CO2): ${this.co2Host}`);
@@ -39,7 +43,6 @@ class MqttConnection {
 
             if (!validCertPath) {
                 console.warn(`⚠️ No TLS certificate found, will try connection without CA verification`);
-                // Still return TLS options but without CA - allows self-signed certs
                 return {
                     rejectUnauthorized: false,
                     secureProtocol: 'TLSv1_2_method',
@@ -59,7 +62,6 @@ class MqttConnection {
             };
         } catch (error) {
             console.warn('⚠️ TLS configuration error:', error.message);
-            // Return minimal TLS options to still attempt secure connection
             return {
                 rejectUnauthorized: false,
                 checkServerIdentity: () => undefined
@@ -68,9 +70,8 @@ class MqttConnection {
     }
 
     connect(onConnectCallback, onMessageCallback, onErrorCallback) {
-        // Connect to primary broker
         const connectOptions = {
-            clientId: `backend-server-${Math.random().toString(16).substr(2, 8)}`,
+            clientId: `backend-primary-${Date.now()}-${Math.random().toString(16).substr(2, 8)}`,
             keepalive: 60,
             clean: true,
             username: process.env.MQTT_USERNAME || "admin",
@@ -83,7 +84,7 @@ class MqttConnection {
 
         console.log(`🔗 Connecting to primary MQTT broker: ${this.host}`);
         console.log(`🔐 TLS enabled: ${this.isTLS}, TLS options keys: ${Object.keys(this.tlsOptions).join(', ') || 'none'}`);
-        
+
         this.mqttClient = mqtt.connect(this.host, connectOptions);
 
         this.mqttClient.on("connect", () => {
@@ -93,7 +94,6 @@ class MqttConnection {
 
         this.mqttClient.on("message", onMessageCallback);
         this.mqttClient.on("error", (err) => {
-            // Only log connection errors once, not on every reconnect attempt
             if (!this._primaryErrorLogged) {
                 console.error("❌ Primary MQTT Error:", err.message);
                 console.warn("⚠️  Primary broker may be unreachable. Other sensors (temp, humidity, etc.) won't work until it's available.");
@@ -108,71 +108,129 @@ class MqttConnection {
             }
         });
         this.mqttClient.on("reconnect", () => {
-            // Reset error flags on reconnect attempt
             this._primaryErrorLogged = false;
             this._primaryOfflineLogged = false;
         });
         this.mqttClient.on("connect", () => {
-            // Reset flags on successful connection
             this._primaryErrorLogged = false;
             this._primaryOfflineLogged = false;
         });
 
-        // Connect to secondary broker for CO2 if configured
-        if (this.co2Host) {
-            this.connectCO2Broker(onMessageCallback, onErrorCallback);
-        }
+        // CO2 is now handled by standalone CO2SensorHandler
+        // Keeping this disabled to avoid duplicate subscriptions
+        // if (this.co2Host) {
+        //     console.log(`🔗 Connecting to CO2 broker: ${this.co2Host}`);
+        //     this.connectCO2Broker(onMessageCallback, onErrorCallback);
+        // }
 
         return this.mqttClient;
     }
 
     connectCO2Broker(onMessageCallback, onErrorCallback) {
+        // Use same client ID pattern as working test script (js_sub_xxx)
         const co2Options = {
-            clientId: `backend-co2-${Math.random().toString(16).substr(2, 8)}`,
-            keepalive: 60,
+            clientId: `js_sub_${Date.now()}_${Math.random().toString(16).substr(2, 8)}`,
+            keepalive: 30,              // Match test script
             clean: true,
             username: process.env.MQTT_USERNAME_CO2 || process.env.MQTT_USERNAME || "admin",
             password: process.env.MQTT_PASSWORD_CO2 || process.env.MQTT_PASSWORD || "StrongPassword123",
             connectTimeout: 30000,
-            reconnectPeriod: 2000,
-            protocolVersion: 4
+            reconnectPeriod: 5000,      // Match test script
+            protocolVersion: 4,
+            resubscribe: true,          // Match test script
+            reschedulePings: true       // Match test script
         };
 
         console.log(`🔗 Connecting to CO2 MQTT broker: ${this.co2Host}`);
+        console.log(`🔗 CO2 broker credentials: user=${co2Options.username}`);
         this.co2Client = mqtt.connect(this.co2Host, co2Options);
 
         this.co2Client.on("connect", () => {
             console.log("🌐 CO2 MQTT Connected!");
-            
-            // Subscribe to CO2 topic
-            this.co2Client.subscribe("CO2", { qos: 1 }, (err) => {
-                if (err) {
-                    console.error("❌ Failed to subscribe to CO2:", err.message);
-                } else {
-                    console.log("✅ Subscribed to CO2 topic on secondary broker");
-                }
-            });
+            console.log(`🌐 CO2 Client ID: ${this.co2Client.options.clientId}`);
 
-            // Subscribe to sonar (level) topic
-            this.co2Client.subscribe("level", { qos: 1 }, (err) => {
+            const topics = ["CO2", "level"];
+            console.log(`📡 Subscribing to topics: ${topics.join(", ")}`);
+
+            this.co2Client.subscribe(topics, { qos: 1 }, (err, granted) => {
                 if (err) {
-                    console.error("❌ Failed to subscribe to level:", err.message);
+                    console.error("❌ Failed to subscribe to CO2/level topics:", err.message);
                 } else {
-                    console.log("✅ Subscribed to level (sonar) topic on secondary broker");
+                    console.log("✅ Subscribed to CO2 and level topics on secondary broker");
+                    console.log(`✅ Subscriptions granted:`, JSON.stringify(granted));
+
+                    granted.forEach(g => {
+                        console.log(`   📡 Topic: "${g.topic}" → QoS: ${g.qos}`);
+                    });
                 }
             });
         });
 
         this.co2Client.on("message", (topic, message) => {
-            console.log(`📨 [CO2 Broker] Topic: "${topic}" | Payload: "${message.toString()}"`);
-            onMessageCallback(topic, message);
+            const payload = message.toString();
+            const now = new Date().toISOString();
+
+            // Update diagnostics
+            this.co2MessageCount++;
+            this.co2LastMessage = { topic, payload, timestamp: now };
+
+            console.log(`📨 [CO2 Broker] #${this.co2MessageCount} Topic: "${topic}" | Payload: "${payload}" | Time: ${now}`);
+
+            try {
+                onMessageCallback(topic, message);
+                console.log(`📨 [CO2 Broker] Message handler completed successfully`);
+            } catch (err) {
+                console.error(`❌ [CO2 Broker] Error in message handler:`, err.message);
+                console.error(`❌ [CO2 Broker] Stack:`, err.stack);
+            }
         });
 
         this.co2Client.on("error", (err) => {
             console.error("❌ CO2 MQTT Error:", err.message);
+            console.error("❌ CO2 MQTT Error details:", err);
+            if (onErrorCallback) onErrorCallback(err);
         });
-        this.co2Client.on("offline", () => console.warn("📴 CO2 MQTT offline"));
-        this.co2Client.on("reconnect", () => console.log("🔄 CO2 MQTT Reconnecting..."));
+
+        this.co2Client.on("offline", () => {
+            console.warn("📴 CO2 MQTT offline");
+            console.warn(`📴 Last message was: ${JSON.stringify(this.co2LastMessage)}`);
+        });
+
+        this.co2Client.on("reconnect", () => {
+            console.log("🔄 CO2 MQTT Reconnecting...");
+        });
+
+        this.co2Client.on("close", () => {
+            console.warn("🔌 CO2 MQTT connection closed");
+            console.warn(`🔌 Total messages received before close: ${this.co2MessageCount}`);
+        });
+
+        this.co2Client.on("disconnect", () => {
+            console.warn("🔌 CO2 MQTT disconnected");
+        });
+
+        // Enhanced debug: Log connection status every 10 seconds
+        setInterval(() => {
+            if (this.co2Client) {
+                const stats = {
+                    connected: this.co2Client.connected,
+                    reconnecting: this.co2Client.reconnecting,
+                    totalMessages: this.co2MessageCount,
+                    lastMessage: this.co2LastMessage,
+                    clientId: this.co2Client.options?.clientId
+                };
+                console.log(`🔍 [CO2 Debug] Status:`, JSON.stringify(stats, null, 2));
+
+                // Alert if no messages in last 15 seconds
+                if (this.co2LastMessage) {
+                    const lastMsgTime = new Date(this.co2LastMessage.timestamp).getTime();
+                    const timeSinceLastMsg = Date.now() - lastMsgTime;
+                    if (timeSinceLastMsg > 15000) {
+                        console.warn(`⚠️ [CO2 Debug] No messages for ${Math.round(timeSinceLastMsg / 1000)}s`);
+                    }
+                }
+            }
+        }, 10000);
     }
 
     publish(topic, message, options = { qos: 1, retain: false }) {
@@ -192,9 +250,20 @@ class MqttConnection {
             console.log("🔌 Primary MQTT disconnected");
         }
         if (this.co2Client?.connected) {
+            console.log(`🔌 CO2 MQTT disconnecting (received ${this.co2MessageCount} messages total)`);
             this.co2Client.end();
             console.log("🔌 CO2 MQTT disconnected");
         }
+    }
+
+    // Get diagnostic info
+    getCO2Stats() {
+        return {
+            connected: this.co2Client?.connected || false,
+            totalMessages: this.co2MessageCount,
+            lastMessage: this.co2LastMessage,
+            clientId: this.co2Client?.options?.clientId
+        };
     }
 }
 

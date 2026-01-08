@@ -1,5 +1,7 @@
 const EnhancedMqttHandler = require("./EnhancedMqttHandler");
 const SpatialTemperatureController = require("./spatialTemperatureController");
+const CO2SensorHandler = require("./Sensors/CO2SensorHandler");
+const LevelSensorHandler = require("./Sensors/LevelSensorHandler");
 
 const initializeMQTT = (io, app) => {
     const mqttClient = new EnhancedMqttHandler(io);
@@ -15,9 +17,21 @@ const initializeMQTT = (io, app) => {
     const spatialController = new SpatialTemperatureController(io);
     spatialController.connect();
 
+    // Initialize standalone CO2 handler (separate from main MQTT)
+    const co2Handler = new CO2SensorHandler(io);
+    co2Handler.connect();
+    console.log(`✅ [mqttSetup] Standalone CO2 handler initialized`);
+
+    // Initialize standalone Level/Sonar handler (separate from main MQTT)
+    const levelHandler = new LevelSensorHandler(io);
+    levelHandler.connect();
+    console.log(`✅ [mqttSetup] Standalone Level handler initialized`);
+
     // Handle graceful shutdown
     const handleShutdown = () => {
         mqttClient.stopSimulation();
+        co2Handler.disconnect();
+        levelHandler.disconnect();
         process.exit();
     };
 
@@ -26,7 +40,9 @@ const initializeMQTT = (io, app) => {
 
     return {
         mqttClient,
-        spatialController
+        spatialController,
+        co2Handler,
+        levelHandler
     };
 };
 

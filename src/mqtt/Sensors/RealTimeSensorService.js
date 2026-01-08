@@ -10,13 +10,21 @@ class RealTimeSensorService {
         this.lastReceivedData = new Map(); // topic -> timestamp
         this.cacheExpiry = 5 * 60 * 1000; // Refresh cache every 5 minutes
         this.lastCacheRefresh = 0;
-        
+        this.dataListeners = []; // NEW: Generic listeners for any sensor data
+
         console.log(`🚀 [RealTimeSensorService] Initialized - NO LATENCY mode for ALL sensors`);
+    }
+
+    // NEW: Register a listener for sensor data events
+    registerDataListener(callback) {
+        this.dataListeners.push(callback);
+        console.log(`📝 [RealTimeSensorService] Registered data listener (total: ${this.dataListeners.length})`);
     }
 
     // Load all sensor configs into memory cache
     async loadSensorCache() {
         try {
+            console.log(`🔄 [RealTimeSensorService] Loading sensor cache...`);
             const [sensors] = await pool.execute(
                 `SELECT s.*, st.type_code, st.type_name, st.unit,
                  r.room_code, r.room_name, r.id as room_id
@@ -29,6 +37,7 @@ class RealTimeSensorService {
             this.sensorCache.clear();
             for (const sensor of sensors) {
                 this.sensorCache.set(sensor.mqtt_topic, sensor);
+                console.log(`   📡 Cached sensor: topic="${sensor.mqtt_topic}" → ${sensor.sensor_name} (${sensor.type_code})`);
             }
 
             this.lastCacheRefresh = Date.now();
@@ -50,9 +59,9 @@ class RealTimeSensorService {
     // Get sensor from cache or DB (with cache update)
     async getSensorConfig(topic) {
         await this.ensureCacheValid();
-        
+
         let sensor = this.sensorCache.get(topic);
-        
+
         if (!sensor) {
             // Cache miss - try DB lookup
             const [sensors] = await pool.execute(
@@ -65,13 +74,13 @@ class RealTimeSensorService {
                  LIMIT 1`,
                 [topic]
             );
-            
+
             if (sensors.length > 0) {
                 sensor = sensors[0];
                 this.sensorCache.set(topic, sensor);
             }
         }
-        
+
         return sensor;
     }
 
@@ -84,17 +93,21 @@ class RealTimeSensorService {
     async handleSensorData(topic, payload) {
         const startTime = Date.now();
         const timestamp = new Date().toISOString();
-        
+
+        console.log(`⚡ [RealTimeSensorService.handleSensorData] Called with topic: "${topic}", payload: "${payload}"`);
+
         try {
             // Get sensor config from cache
             const sensor = await this.getSensorConfig(topic);
-            
+
             if (!sensor) {
                 // Not a sensor topic - return false so actuator handling can try
+                console.log(`⚡ [RealTimeSensorService] No sensor found for topic: "${topic}"`);
                 return false;
             }
 
             console.log(`⚡ [RealTime] Processing ${sensor.type_code} from topic "${topic}"`);
+            console.log(`⚡ [RealTime] Sensor ID: ${sensor.id}, User: ${sensor.user_id}, Room: ${sensor.room_code}`);
 
             // Parse and validate value
             let value;
@@ -112,7 +125,7 @@ class RealTimeSensorService {
                     console.warn(`⚠️ [RealTime] Invalid value on ${topic}: "${payload}"`);
                     return false;
                 }
-                
+
                 // Sanity check for extreme values
                 if (Math.abs(value) > 1e10) {
                     console.warn(`⚠️ [RealTime] Value too extreme on ${topic}: ${value}`);
@@ -123,32 +136,44 @@ class RealTimeSensorService {
             // Track data reception
             this.lastReceivedData.set(topic, Date.now());
 
-            // ⚡ IMMEDIATE DATABASE WRITE (no buffering)
-            const connection = await pool.getConnection();
-            try {
-                await connection.beginTransaction();
+            // ⚡ IMMEDIATE DATABASE WRITE (no buffering) with retry for deadlocks
+            let retries = 3;
+            while (retries > 0) {
+                const connection = await pool.getConnection();
+                try {
+                    await connection.beginTransaction();
 
-                // Insert measurement
-                const [result] = await connection.execute(
-                    `INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) 
-                     VALUES (?, ?, NOW(3), 100)`,
-                    [sensor.id, value]
-                );
+                    // Insert measurement
+                    const [result] = await connection.execute(
+                        `INSERT INTO sensor_measurements (sensor_id, measured_value, measured_at, quality_indicator) 
+                         VALUES (?, ?, NOW(3), 100)`,
+                        [sensor.id, value]
+                    );
 
-                // Update last_reading_at
-                await connection.execute(
-                    'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
-                    [sensor.id]
-                );
+                    // Update last_reading_at
+                    await connection.execute(
+                        'UPDATE sensors SET last_reading_at = NOW(3) WHERE id = ?',
+                        [sensor.id]
+                    );
 
-                await connection.commit();
-                console.log(`   💾 [RealTime] DB write complete (ID: ${result.insertId})`);
+                    await connection.commit();
+                    console.log(`   💾 [RealTime] DB write complete (ID: ${result.insertId})`);
+                    connection.release();
+                    break; // Success, exit retry loop
 
-            } catch (dbError) {
-                await connection.rollback();
-                throw dbError;
-            } finally {
-                connection.release();
+                } catch (dbError) {
+                    await connection.rollback();
+                    connection.release();
+
+                    // Retry on deadlock
+                    if (dbError.code === 'ER_LOCK_DEADLOCK' && retries > 1) {
+                        retries--;
+                        console.warn(`⚠️ [RealTime] Deadlock detected, retrying... (${retries} left)`);
+                        await new Promise(r => setTimeout(r, 50 + Math.random() * 100)); // Random backoff
+                        continue;
+                    }
+                    throw dbError;
+                }
             }
 
             // ⚡ IMMEDIATE SOCKET.IO EMISSION (parallel to all rooms)
@@ -200,6 +225,15 @@ class RealTimeSensorService {
             const processingTime = Date.now() - startTime;
             console.log(`⚡ [RealTime] ${sensor.type_code}: ${value}${sensor.unit || ''} → ${userRoom} (${processingTime}ms)`);
 
+            // Notify all registered listeners (generic, no hardcoded types)
+            for (const listener of this.dataListeners) {
+                try {
+                    listener(topic, value, sensor);
+                } catch (err) {
+                    console.error(`❌ [RealTime] Listener error:`, err.message);
+                }
+            }
+
             return true;
 
         } catch (error) {
@@ -213,7 +247,7 @@ class RealTimeSensorService {
      */
     async handleMultipleSensors(topic, payload) {
         const startTime = Date.now();
-        
+
         try {
             // Find ALL sensors for this topic
             const [sensors] = await pool.execute(
@@ -231,7 +265,7 @@ class RealTimeSensorService {
             }
 
             // Process all sensors in parallel
-            await Promise.all(sensors.map(sensor => 
+            await Promise.all(sensors.map(sensor =>
                 this.processSingleSensor(sensor, payload)
             ));
 
@@ -248,7 +282,7 @@ class RealTimeSensorService {
 
     async processSingleSensor(sensor, payload) {
         const timestamp = new Date().toISOString();
-        
+
         try {
             // Parse value
             let value;
@@ -328,6 +362,15 @@ class RealTimeSensorService {
                 timestamp: timestamp
             });
 
+            // Notify listeners
+            for (const listener of this.dataListeners) {
+                try {
+                    listener(sensor.mqtt_topic, value, sensor);
+                } catch (err) {
+                    console.error(`❌ [RealTime] Listener error:`, err.message);
+                }
+            }
+
         } catch (error) {
             console.error(`❌ [RealTime] Error processing sensor ${sensor.id}:`, error.message);
         }
@@ -350,7 +393,7 @@ class RealTimeSensorService {
     getStaleSensors(thresholdMs = 10000) {
         const now = Date.now();
         const stale = [];
-        
+
         for (const [topic, sensor] of this.sensorCache) {
             const lastReceived = this.lastReceivedData.get(topic);
             if (!lastReceived || (now - lastReceived) > thresholdMs) {
@@ -362,7 +405,7 @@ class RealTimeSensorService {
                 });
             }
         }
-        
+
         return stale;
     }
 }

@@ -4,22 +4,23 @@
 const pool = require('../../config/db');
 
 class CO2PollingService {
-    constructor(mqttClient, co2Handler) {
-        this.mqttClient = mqttClient;
+    constructor(primaryClient, co2Client, co2Handler) {
+        this.primaryClient = primaryClient;
+        this.co2Client = co2Client;  // ← NEW: Dedicated CO2 client
         this.co2Handler = co2Handler;
         this.pollingInterval = null;
         this.isPolling = false;
         this.pollFrequency = 1000; // Poll every 1 second
         this.co2Topics = new Map(); // Map of topic -> sensor info
         this.lastReceivedData = new Map(); // Track last received data per topic
-        
-        console.log(`🔵 [CO2PollingService] Initialized`);
+
+        console.log(`🔵 [CO2PollingService] Initialized with ${co2Client ? 'dedicated CO2 client' : 'primary client only'}`);
     }
 
     async loadCO2Sensors() {
         try {
             console.log(`🔍 [CO2PollingService] Loading CO2 sensors from database...`);
-            
+
             const [sensors] = await pool.execute(
                 `SELECT s.id, s.sensor_name, s.mqtt_topic, s.user_id, s.room_id, 
                         r.room_code, r.room_name, st.type_code
@@ -30,7 +31,7 @@ class CO2PollingService {
             );
 
             this.co2Topics.clear();
-            
+
             for (const sensor of sensors) {
                 if (sensor.mqtt_topic) {
                     this.co2Topics.set(sensor.mqtt_topic, {
@@ -48,7 +49,7 @@ class CO2PollingService {
 
             console.log(`✅ [CO2PollingService] Loaded ${this.co2Topics.size} CO2 sensor(s)`);
             return this.co2Topics.size;
-            
+
         } catch (error) {
             console.error(`❌ [CO2PollingService] Error loading sensors:`, error.message);
             return 0;
@@ -63,39 +64,40 @@ class CO2PollingService {
 
         // Load CO2 sensors first
         const sensorCount = await this.loadCO2Sensors();
-        
+
         if (sensorCount === 0) {
             console.warn(`⚠️ [CO2PollingService] No CO2 sensors found. Polling not started.`);
             return;
         }
 
         this.isPolling = true;
-        console.log(`🚀 [CO2PollingService] Starting active polling every ${this.pollFrequency}ms`);
+        console.log(`🚀 [CO2PollingService] Starting monitoring every ${this.pollFrequency}ms`);
+        console.log(`📝 Note: CO2 topics are subscribed by MqttConnection.connectCO2Broker()`);
+        console.log(`📝 This service only monitors data flow and checks for gaps`);
 
-        // Subscribe to all CO2 topics
-        for (const [topic, sensor] of this.co2Topics) {
-            this.subscribeToTopic(topic);
-        }
-
-        // Start polling interval
+        // Start monitoring interval (no subscriptions - already done in MqttConnection)
         this.pollingInterval = setInterval(() => {
             this.pollCO2Data();
         }, this.pollFrequency);
 
-        console.log(`✅ [CO2PollingService] Polling started`);
+        console.log(`✅ [CO2PollingService] Monitoring started for topics: ${Array.from(this.co2Topics.keys()).join(', ')}`);
     }
 
     subscribeToTopic(topic) {
-        if (!this.mqttClient || !this.mqttClient.connected) {
-            console.error(`❌ [CO2PollingService] MQTT client not connected`);
+        // Use the appropriate client based on setup
+        const client = this.co2Client || this.primaryClient;
+
+        if (!client || !client.connected) {
+            console.error(`❌ [CO2PollingService] MQTT client not connected for topic: ${topic}`);
             return;
         }
 
-        this.mqttClient.subscribe(topic, { qos: 1 }, (err) => {
+        client.subscribe(topic, { qos: 1 }, (err) => {
             if (err) {
                 console.error(`❌ [CO2PollingService] Failed to subscribe to ${topic}:`, err.message);
             } else {
-                console.log(`✅ [CO2PollingService] Subscribed to: ${topic}`);
+                const clientType = this.co2Client ? 'CO2 broker' : 'primary broker';
+                console.log(`✅ [CO2PollingService] Subscribed to ${topic} on ${clientType}`);
             }
         });
     }
@@ -114,11 +116,8 @@ class CO2PollingService {
                     // Only log every 10 seconds to avoid spam
                     if (timeSinceLastData % 10000 < 1000) {
                         console.warn(`⚠️ [CO2PollingService] No data from ${topic} for ${Math.round(timeSinceLastData / 1000)}s`);
-                        console.warn(`   💡 Check if your CO2 sensor is publishing data automatically`);
+                        console.warn(`   💡 Last value: ${this._lastValues?.get(topic) || 'never received'}`);
                     }
-                    
-                    // Don't request data since sensor echoes back our request
-                    // this.requestSensorData(topic);
                 }
 
                 // Check database for latest reading (less frequently)
@@ -130,33 +129,6 @@ class CO2PollingService {
                 console.error(`❌ [CO2PollingService] Error polling ${topic}:`, error.message);
             }
         }
-    }
-
-    requestSensorData(topic) {
-        if (!this.mqttClient || !this.mqttClient.connected) {
-            console.error(`❌ [CO2PollingService] MQTT client not connected`);
-            return;
-        }
-
-        // ⚠️ IMPORTANT: Your CO2 sensor doesn't respond to requests properly
-        // It echoes back whatever we send instead of sending actual values
-        // So we'll just log a warning instead of sending requests
-        
-        console.log(`⚠️ [CO2PollingService] Waiting for sensor to publish data on: ${topic}`);
-        console.log(`   💡 Tip: Check if your CO2 sensor is configured to auto-publish data`);
-        
-        // Don't send request - just wait for sensor to publish
-        // If you need to send a specific command, uncomment and modify below:
-        
-        /*
-        // Example: If your sensor responds to a specific command
-        const requestMessage = 'READ_CO2';  // Change this to your sensor's command
-        this.mqttClient.publish(topic, requestMessage, { qos: 1 }, (err) => {
-            if (err) {
-                console.error(`❌ [CO2PollingService] Failed to request data:`, err.message);
-            }
-        });
-        */
     }
 
     async checkDatabaseForRecentData(sensor) {
@@ -175,11 +147,11 @@ class CO2PollingService {
                 const lastMeasurementTime = new Date(lastMeasurement.measured_at).getTime();
                 const timeSinceLastMeasurement = Date.now() - lastMeasurementTime;
 
-                if (timeSinceLastMeasurement > 5000) {
-                    console.warn(`⚠️ [CO2PollingService] No recent data for ${sensor.name} (last: ${Math.round(timeSinceLastMeasurement / 1000)}s ago)`);
+                if (timeSinceLastMeasurement > 10000) {
+                    console.warn(`⚠️ [CO2PollingService] Database shows stale data for ${sensor.name} (last: ${Math.round(timeSinceLastMeasurement / 1000)}s ago, value: ${lastMeasurement.measured_value})`);
                 }
             } else {
-                console.warn(`⚠️ [CO2PollingService] No measurements found for ${sensor.name}`);
+                console.warn(`⚠️ [CO2PollingService] No measurements found in database for ${sensor.name}`);
             }
         } catch (error) {
             console.error(`❌ [CO2PollingService] Database check error:`, error.message);
@@ -192,9 +164,15 @@ class CO2PollingService {
         const numericValue = parseFloat(value);
         if (Number.isFinite(numericValue)) {
             this.lastReceivedData.set(topic, Date.now());
-            console.log(`✅ [CO2PollingService] Valid CO2 data received: ${numericValue} ppm`);
+
+            // Track last values for debugging
+            if (!this._lastValues) this._lastValues = new Map();
+            this._lastValues.set(topic, numericValue);
+
+            const timeSinceStart = Date.now() - (this._startTime || Date.now());
+            console.log(`✅ [CO2PollingService] Data received on "${topic}": ${numericValue} ppm (runtime: ${Math.round(timeSinceStart / 1000)}s)`);
         } else {
-            console.warn(`⚠️ [CO2PollingService] Received non-numeric value: "${value}" (ignoring)`);
+            console.warn(`⚠️ [CO2PollingService] Received non-numeric value on "${topic}": "${value}" (ignoring)`);
         }
     }
 
@@ -210,10 +188,12 @@ class CO2PollingService {
     async reloadSensors() {
         console.log(`🔄 [CO2PollingService] Reloading sensors...`);
         await this.loadCO2Sensors();
-        
-        // Resubscribe to new topics
-        for (const [topic] of this.co2Topics) {
-            this.subscribeToTopic(topic);
+
+        // Resubscribe to new topics if needed
+        if (!this.co2Client) {
+            for (const [topic] of this.co2Topics) {
+                this.subscribeToTopic(topic);
+            }
         }
     }
 
@@ -222,11 +202,13 @@ class CO2PollingService {
             isPolling: this.isPolling,
             pollFrequency: this.pollFrequency,
             sensorCount: this.co2Topics.size,
+            hasCO2Client: !!this.co2Client,
             sensors: Array.from(this.co2Topics.values()),
             lastReceivedData: Array.from(this.lastReceivedData.entries()).map(([topic, timestamp]) => ({
                 topic,
                 lastReceived: new Date(timestamp).toISOString(),
-                timeSinceLastData: Date.now() - timestamp
+                timeSinceLastData: Date.now() - timestamp,
+                lastValue: this._lastValues?.get(topic)
             }))
         };
     }
